@@ -42,6 +42,7 @@ def parse_args():
     ap.add_argument("--logv_min", type=float, default=tr.get("logv_min",-12.0))
     ap.add_argument("--logv_max", type=float, default=tr.get("logv_max",6.0))
     ap.add_argument("--anchor_weight", type=float, default=tr.get("anchor_weight",0.0))
+    ap.add_argument("--early_patience", type=int, default=tr.get("early_patience", 10))
     ap.add_argument("--device", default=rt.get("device","cuda" if torch.cuda.is_available() else "cpu"))
     return ap.parse_args()
 
@@ -68,6 +69,7 @@ def main():
 
     opt = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     best_val = 1e9
+    epochs_since_improve = 0
     best_path = str(Path(args.run_dir) / "best.pt")
 
     def run_epoch(loader, training: bool):
@@ -110,7 +112,13 @@ def main():
 
         if val_loss < best_val:
             best_val = val_loss
+            epochs_since_improve = 0
             torch.save({"model": model.state_dict(), "args": vars(args)}, best_path)
+        else:
+            epochs_since_improve += 1
+            if epochs_since_improve >= args.early_patience:
+                print(f"[early-stop] No improvement for {args.early_patience} epochs. Stopping at epoch {epoch}.")
+                break
 
     # Final test
     ckpt = torch.load(best_path, map_location="cpu")

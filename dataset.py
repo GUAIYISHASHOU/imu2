@@ -44,7 +44,7 @@ class IMURouteDataset(Dataset):
         if M is None:
             raise ValueError(f"{self.npz_path}: missing MASK/y_mask")
 
-        assert X.ndim == 3 and X.shape[-1] >= 6
+        assert X.ndim == 3 and X.shape[-1] >= 3
         if E2.ndim == 2:
             E2 = E2[..., None]
         assert E2.ndim == 3
@@ -74,7 +74,7 @@ class IMURouteDataset(Dataset):
         if self.route == "acc":
             E2_route = E2[..., 0:1] if E2.shape[-1] > 1 else E2
             Y = self.Y_acc[idx] if self.Y_acc is not None else None
-            if self.x_mode == "route_only":
+            if self.x_mode == "route_only" and X.shape[-1] >= 6:
                 X = X[..., :3]
         else:
             if E2.shape[-1] == 1:
@@ -84,7 +84,7 @@ class IMURouteDataset(Dataset):
             else:
                 raise ValueError("E2 must have >=1 channels")
             Y = self.Y_gyr[idx] if self.Y_gyr is not None else None
-            if self.x_mode == "route_only":
+            if self.x_mode == "route_only" and X.shape[-1] >= 6:
                 X = X[..., 3:6]
 
         out = {

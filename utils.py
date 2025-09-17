@@ -1,4 +1,5 @@
 import math, os, random, json
+from datetime import datetime
 from pathlib import Path
 import numpy as np
 import torch
@@ -44,3 +45,8 @@ def load_config_file(path: str | None):
             raise RuntimeError("Reading YAML requires PyYAML: pip install pyyaml") from e
         return yaml.safe_load(text) or {}
     raise ValueError(f"Unsupported config format: {suffix}. Use .json or .yaml")
+
+
+def timestamp_str() -> str:
+    """Return local timestamp string like YYYYMMDD_HHMMSS."""
+    return datetime.now().strftime("%Y%m%d_%H%M%S")

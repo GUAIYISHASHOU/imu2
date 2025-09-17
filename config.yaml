@@ -11,13 +11,13 @@ gen_data:
 bicycle:
   out: data_cache
   seed: 42
-  traj_duration_s: 60
+  traj_duration_s: 500
   rate_hz: 100
   window_size: 256
   window_stride: 128
-  train_routes: 1
-  val_routes: 1
-  test_routes: 1
+  train_routes: 6
+  val_routes: 2
+  test_routes: 2
   # Kinematic bicycle physics
   wheelbase: 2.7
   rear_ratio: 0.55
@@ -33,11 +33,11 @@ bicycle:
 # Training configuration (used by train.py)
 train:
   route: acc               # acc or gyr
-  train_npz: data/synth/train.npz
-  val_npz: data/synth/val.npz
-  test_npz: data/synth/test.npz
+  train_npz: data_cache/train_acc.npz
+  val_npz: data_cache/val_acc.npz
+  test_npz: data_cache/test_acc.npz
   run_dir: runs/acc
-  epochs: 10
+  epochs: 300
   batch_size: 32
   lr: 0.001
   x_mode: both            # both or route_only

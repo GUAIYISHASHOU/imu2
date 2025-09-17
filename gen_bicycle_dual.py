@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import numpy as np
-from utils import load_config_file
+from utils import load_config_file, timestamp_str
 
 def _rot_matrix_zxy(yaw: float, pitch: float, roll: float) -> np.ndarray:
     cy, sy = np.cos(yaw), np.sin(yaw)
@@ -345,9 +345,12 @@ def main():
 
     # 输出控制
     ap.add_argument("--no_combined", action="store_true", default=bool(by.get("no_combined", False)), help="不写合并版 *.npz（仅写 *_acc / *_gyr）")
+    ap.add_argument("--timestamp_out", action="store_true", default=bool(by.get("timestamp_out", True)), help="输出写入 out/时间戳 子目录")
 
     args = ap.parse_args()
     out = Path(args.out)
+    if args.timestamp_out:
+        out = out / timestamp_str()
 
     # train/val/test 三个 split 同源但不同 routes；不会互相泄露
     comb_tr, acc_tr, gyr_tr = make_split_dual(
