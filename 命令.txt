@@ -1,0 +1,83 @@
+# 解压后进入目录
+python gen_data.py --out data/synth --N 1200 --T 50 --seed 0
+
+# 训练 acc
+python train.py --route acc --train_npz data/synth/train.npz --val_npz data/synth/val.npz \
+  --test_npz data/synth/test.npz --run_dir runs/acc --x_mode both --epochs 10 \
+  --batch_size 32 --lr 1e-3 --logv_min -12 --logv_max 6
+
+# 训练 gyr
+python train.py --route gyr --train_npz data/synth/train.npz --val_npz data/synth/val.npz \
+  --test_npz data/synth/test.npz --run_dir runs/gyr --x_mode both --epochs 10 \
+  --batch_size 32 --lr 1e-3 --logv_min -16 --logv_max 4
+
+# 评测
+python eval.py --route acc --npz data/synth/test.npz --model runs/acc/best.pt
+python eval.py --route gyr --npz data/synth/test.npz --model runs/gyr/best.pt
+
+# 生成长轨迹数据（bicycle 仿真，双路输出，分路可配置窗口/预处理）
+# 使用统一 YAML（读取 bicycle: 段）
+#   py -3 gen_bicycle_dual.py --config config.yaml
+
+# 统一 YAML 配置（示例：config.yaml）
+# gen_data:
+#   out: data/synth
+#   N: 1200
+#   T: 50
+#   seed: 0
+# train:
+#   route: acc
+#   train_npz: data/synth/train.npz
+#   val_npz: data/synth/val.npz
+#   test_npz: data/synth/test.npz
+#   run_dir: runs/acc
+#   epochs: 10
+#   batch_size: 32
+#   lr: 0.001
+#   x_mode: both
+#   logv_min: -12
+#   logv_max: 6
+#   seed: 0
+# model:
+#   d_model: 128
+#   n_tcn: 4
+#   kernel_size: 3
+#   n_heads: 4
+#   n_layers_tf: 2
+#   dropout: 0.1
+# runtime:
+#   num_workers: 0
+#   device: cuda
+# eval:
+#   route: acc
+#   npz: data/synth/test.npz
+#   model: runs/acc/best.pt
+# bicycle:
+#   out: data_cache
+#   seed: 42
+#   traj_duration_s: 120
+#   rate_hz: 100
+#   window_size: 512
+#   window_stride: 256
+#   train_routes: 4
+#   val_routes: 1
+#   test_routes: 1
+#   wheelbase: 2.7
+#   rear_ratio: 0.55
+#   use_slip: true
+#   use_gravity: true
+#   use_roll_pitch: true
+#   bank_gain: 1.0
+#   pitch_gain: 1.0
+#   no_combined: false
+#   no_split_routes: false
+
+# 使用：
+# 生成 toy 数据：
+#   py -3 gen_data.py --config config.yaml
+# 训练：
+#   py -3 train.py --config config.yaml
+# 评测：
+#   py -3 eval.py --config config.yaml
+# 生成长轨迹（bicycle）：
+#   py -3 gen_bicycle.py --config config.yaml

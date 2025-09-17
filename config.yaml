@@ -1,0 +1,67 @@
+# Unified configuration for data generation, training, and evaluation
+
+# Toy synthetic short-window dataset (used by gen_data.py)
+gen_data:
+  out: data/synth
+  N: 1200
+  T: 50
+  seed: 0
+
+# Long-trajectory bicycle simulation + sliding windows (used by gen_bicycle.py)
+bicycle:
+  out: data_cache
+  seed: 42
+  traj_duration_s: 60
+  rate_hz: 100
+  window_size: 256
+  window_stride: 128
+  train_routes: 1
+  val_routes: 1
+  test_routes: 1
+  # Kinematic bicycle physics
+  wheelbase: 2.7
+  rear_ratio: 0.55
+  use_slip: true
+  use_gravity: true
+  use_roll_pitch: true
+  bank_gain: 1.0
+  pitch_gain: 1.0
+  # Output control
+  no_combined: false
+  no_split_routes: false
+
+# Training configuration (used by train.py)
+train:
+  route: acc               # acc or gyr
+  train_npz: data/synth/train.npz
+  val_npz: data/synth/val.npz
+  test_npz: data/synth/test.npz
+  run_dir: runs/acc
+  epochs: 10
+  batch_size: 32
+  lr: 0.001
+  x_mode: both            # both or route_only
+  target_mode: pooled2    # two-quantity supervision (uses E2)
+  logv_min: -12
+  logv_max: 6
+  seed: 0
+
+# Model architecture (used by train.py)
+model:
+  d_model: 128
+  n_tcn: 4
+  kernel_size: 3
+  n_heads: 4
+  n_layers_tf: 2
+  dropout: 0.1
+
+# Runtime options shared by train/eval
+runtime:
+  num_workers: 0
+  device: cuda            # set to cpu if no GPU
+
+# Evaluation (used by eval.py)
+eval:
+  route: acc
+  npz: data/synth/test.npz
+  model: runs/acc/best.pt
