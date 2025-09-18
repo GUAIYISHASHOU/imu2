@@ -62,6 +62,6 @@ runtime:
 
 # Evaluation (used by eval.py)
 eval:
-  route: acc
-  npz: data_cache/test_acc.npz
-  model: runs/acc/best.pt
+  route: gyr
+  npz: data_cache/test_gyr.npz
+  model: runs/gyr/best.pt

@@ -450,6 +450,56 @@ def make_splits(out_dir: Path,
     savetag("val",   acc_va, gyr_va, vis_va)
     savetag("test",  acc_te, gyr_te, vis_te)
 
+    # ---- 追加：VIS 端元数据与分段标签（最小自检产物） ----
+    synth_vis_dir = out_dir / "synth_vis"
+    synth_vis_dir.mkdir(parents=True, exist_ok=True)
+
+    # 拆包 VIS 三路
+    Xv_tr, Ev_tr, Mv_tr = vis_tr
+    Xv_va, Ev_va, Mv_va = vis_va
+    Xv_te, Ev_te, Mv_te = vis_te
+
+    # 训练集统计（用于标准化/一致性校验）
+    train_mean = np.mean(Xv_tr.reshape(-1, Xv_tr.shape[-1]), axis=0).astype(np.float32) if Xv_tr.size>0 else np.zeros((Xv_tr.shape[-1],), np.float32)
+    train_std  = np.std( Xv_tr.reshape(-1, Xv_tr.shape[-1]), axis=0).astype(np.float32) + 1e-12
+
+    # 读取各 split seg_id（前面已保存 per-split 标签）
+    seg_id_train = np.load(out_dir / "train_seg_id.npy") if (out_dir/"train_seg_id.npy").exists() else np.zeros((Xv_tr.shape[0]*Xv_tr.shape[1],), np.int32)
+    seg_id_val   = np.load(out_dir / "val_seg_id.npy")   if (out_dir/"val_seg_id.npy").exists()   else np.zeros((Xv_va.shape[0]*Xv_va.shape[1],), np.int32)
+    seg_id_test  = np.load(out_dir / "test_seg_id.npy")  if (out_dir/"test_seg_id.npy").exists()  else np.zeros((Xv_te.shape[0]*Xv_te.shape[1],), np.int32)
+
+    # vis_meta.json（按当前 X_vis 列定义）
+    meta = {
+        "unit": "px",
+        "feature_names": [
+            "num_inlier_norm","flow_mag_mean","flow_mag_std","baseline_m",
+            "yaw_rate","speed_proxy","roll","pitch"
+        ],
+        "standardize": {
+            "enable": True,
+            "mean": train_mean.tolist(),
+            "std":  train_std.tolist()
+        },
+        "random": {
+            "base_seed": seed,
+            "seeds": {"train": seed+1000, "val": seed+2000, "test": seed+3000},
+            "target_cover": {"pure_rot":0.15,"low_parallax":0.20,"inlier_drop":0.10},
+            "dur_s": [0.8, 2.0],
+            "cooldown_s": 0.3
+        }
+    }
+    (synth_vis_dir / "vis_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # 分段标签另存一份到 synth_vis
+    np.save(synth_vis_dir / "seg_id_train.npy", seg_id_train.astype(np.int32))
+    np.save(synth_vis_dir / "seg_id_val.npy",   seg_id_val.astype(np.int32))
+    np.save(synth_vis_dir / "seg_id_test.npy",  seg_id_test.astype(np.int32))
+
+    # 可选：把 seg_id 内嵌进单独的 VIS npz（便于单文件分析）
+    np.savez(synth_vis_dir/"train.npz", X_vis=Xv_tr, E_vis=Ev_tr, mask_vis=Mv_tr, seg_id=seg_id_train)
+    np.savez(synth_vis_dir/"val.npz",   X_vis=Xv_va, E_vis=Ev_va, mask_vis=Mv_va, seg_id=seg_id_val)
+    np.savez(synth_vis_dir/"test.npz",  X_vis=Xv_te, E_vis=Ev_te, mask_vis=Mv_te, seg_id=seg_id_test)
+
 def main():
     ap = argparse.ArgumentParser("One-shot sim: ACC/GYR/VIS from a shared bicycle trajectory (two-quantity supervision)")
     ap.add_argument("--out", required=True)
