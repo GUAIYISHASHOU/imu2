@@ -198,7 +198,8 @@ def simulate_vision_from_trajectory(T_cam, t_cam_idx, yaw, roll, pitch, xy,     
     # 这里假设外部传进来的是 100Hz 的 yaw/speed/roll/pitch（与 IMU 同频）；我们用相机索引取子序列
     # yaw_rate: 差分（相机频率上）
     yaw_cam = yaw[t_cam_idx]; speed_cam = np.gradient(xy[t_cam_idx,0], edge_order=1) * 0  # 占位，后面替换
-    speed_cam = np.linalg.norm(np.diff(xy[t_cam_idx], axis=0, prepend=xy[t_cam_idx:t_cam_idx+1]), axis=1)  # 粗略速度像素/帧
+    xy_cam = xy[t_cam_idx]
+    speed_cam = np.linalg.norm(np.diff(xy_cam, axis=0, prepend=xy_cam[:1]), axis=1)  # 粗略速度像素/帧
     yaw_rate_cam = np.diff(yaw_cam, prepend=yaw_cam[:1]) / max(1, (t_cam_idx[1]-t_cam_idx[0]))
     roll_cam = roll[t_cam_idx]; pitch_cam = pitch[t_cam_idx]
 
@@ -305,11 +306,15 @@ def make_splits(out_dir: Path,
         print(f"[vis-gen][WARN] {msg}")
 
     def approx_unit_check_flow(flow_mean_px, tag="flow_mean"):
-        med = float(np.median(np.abs(flow_mean_px)))
-        if med < 0.02:
-            warn(f"{tag} median≈{med:.4f} px, 像素量级过小，是否被归一化？")
-        if med > 20.0:
-            warn(f"{tag} median≈{med:.2f} px, 过大；检查焦距/单位混用")
+        arr = np.asarray(flow_mean_px)
+        if arr.size == 0:
+            print(f"[vis-gen][WARN] {tag}: no valid frames")
+            return
+        med = float(np.median(arr))
+        if med < 0.05:
+            print(f"[vis-gen][WARN] {tag} median≈{med:.4f} px (too small?)")
+        elif med > 20.0:
+            print(f"[vis-gen][WARN] {tag} median≈{med:.2f} px (too large?)")
 
     def write_vis_meta(out_dir_meta: Path):
         meta = {
@@ -360,8 +365,11 @@ def make_splits(out_dir: Path,
             )
 
             # ---- 轻量自检与段标 ----
-            # 单位量级检查（基于光流均值，像素）
-            approx_unit_check_flow(X_vis[:,1], tag=f"{split_name}/route{r}/flow_mean")
+            # 有效覆盖率与单位量级检查（基于光流均值，像素）
+            valid = (M_vis > 0.5).reshape(-1)
+            cov = float(valid.mean()) if valid.size else 0.0
+            print(f"[{split_name}] vis_coverage={cov:.3f}")
+            approx_unit_check_flow(X_vis[valid, 1] if valid.any() else np.array([]), tag=f"{split_name}/route{r}/flow_mean")
             # 段落标注（启发式）：1=纯旋(转动大/基线小)，2=弱视差(流量小&基线小)，3=内点下降(内点比小)
             seg_id = np.zeros((T_cam,), dtype=np.int32)
             baseline = X_vis[:,3]
