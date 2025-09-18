@@ -1,18 +1,12 @@
 # Unified configuration for data generation, training, and evaluation
 
-# Toy synthetic short-window dataset (used by gen_data.py)
-gen_data:
-  out: data/synth
-  N: 1200
-  T: 50
-  seed: 0
-
-# Long-trajectory bicycle simulation + sliding windows (used by gen_bicycle.py)
+# IMU-only generator (gen_bicycle_dual.py)
 bicycle:
   out: data_cache
   seed: 42
   traj_duration_s: 500
   rate_hz: 100
+  # 用作 acc/gyr 的默认窗口；若想分开，可再加 acc_window_size/gyr_window_size 覆盖
   window_size: 256
   window_stride: 128
   train_routes: 6
@@ -28,11 +22,12 @@ bicycle:
   pitch_gain: 1.0
   # Output control
   no_combined: false
+  timestamp_out: false   # ✅ 关键：关闭时间戳目录，路径与 train_npz 对齐
   no_split_routes: false
 
-# Training configuration (used by train.py)
+# Training configuration (train.py)
 train:
-  route: gyr               # acc or gyr
+  route: gyr
   train_npz: data_cache/train_gyr.npz
   val_npz: data_cache/val_gyr.npz
   test_npz: data_cache/test_gyr.npz
@@ -40,13 +35,16 @@ train:
   epochs: 300
   batch_size: 32
   lr: 0.001
-  x_mode: both            # both or route_only
-  target_mode: pooled2    # two-quantity supervision (uses E2)
+  x_mode: both
+  # target_mode: pooled2  # ❌ 删除（train.py 未使用）
   logv_min: -12
   logv_max: 6
   seed: 0
+  # 需要的话可加：
+  # early_patience: 10
+  # anchor_weight: 0.0
 
-# Model architecture (used by train.py)
+# Model architecture
 model:
   d_model: 128
   n_tcn: 4
@@ -55,19 +53,19 @@ model:
   n_layers_tf: 2
   dropout: 0.1
 
-# Runtime options shared by train/eval
 runtime:
   num_workers: 0
-  device: cuda            # set to cpu if no GPU
+  device: cuda
 
-# Evaluation (used by eval.py)
 eval:
   route: gyr
   npz: data_cache/test_gyr.npz
   model: runs/gyr/best.pt
+  x_mode: both
 
+# Visual+IMU generator (gen_bicycle_dual_vis.py)
 vis:
-  out: data_vis
+  out: data_vis          
   seed: 42
   traj_duration_s: 120
   rate_hz: 100
