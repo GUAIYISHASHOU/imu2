@@ -65,3 +65,24 @@ eval:
   route: gyr
   npz: data_cache/test_gyr.npz
   model: runs/gyr/best.pt
+
+vis:
+  out: data_vis
+  seed: 42
+  traj_duration_s: 120
+  rate_hz: 100
+  train_routes: 2
+  val_routes: 1
+  test_routes: 1
+  cam_rate_hz: 10
+  img_w: 640
+  img_h: 480
+  fx: 400.0
+  fy: 400.0
+  cx: 320.0
+  cy: 240.0
+  vis_window: 64
+  vis_stride: 32
+  noise_px: 0.5
+  outlier_ratio: 0.1
+  min_match: 20

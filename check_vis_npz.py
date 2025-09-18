@@ -42,7 +42,17 @@ def main():
     p = Path(args.npz)
     data = np.load(p, allow_pickle=True)
     X, E = data[args.x_key], data[args.err_key]
-    M = data[args.mask_key] if args.mask_key in data else np.ones_like(E, dtype=bool)
+    M = data[args.mask_key] if args.mask_key in data else None
+
+    # 适配 3D 窗口 (N,T,D) => 拉平成 2D (N*T,D)
+    if X.ndim == 3:
+        X = X.reshape(-1, X.shape[-1])
+    if E.ndim == 3:
+        E = E.reshape(-1, E.shape[-1])
+    if M is None:
+        M = np.ones_like(E, dtype=bool)
+    elif M.ndim == 3:
+        M = M.reshape(-1, M.shape[-1])
 
     # 形状 & 缺失
     T, D = X.shape

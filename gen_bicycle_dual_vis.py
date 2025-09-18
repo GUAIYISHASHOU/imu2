@@ -5,6 +5,7 @@ import argparse
 from pathlib import Path
 import json
 import numpy as np
+from utils import load_config_file
 
 # -------------------- 线性代数小工具 --------------------
 def skew(v):
@@ -166,7 +167,7 @@ def simulate_vision_from_trajectory(T_cam, t_cam_idx, yaw, roll, pitch, xy,     
     基于轨迹位姿 + 3D 地图，仿真相机观测与相邻帧匹配，并计算每帧 E2_vis。
     返回：
       E2_vis: (T_cam,)  每帧（与上一帧）Sampson^2 的和（若匹配不足则置 0，mask=0）
-      X_vis:  (T_cam, D) 每帧特征（num_inliers_norm, mean_flow_px, std_flow_px, baseline_m, yaw_rate, speed, roll, pitch）
+      X_vis:  (T_cam, D) 每帧特征（num_inliers_norm, mean_flow_px, std_flow_px, baseline_norm, yaw_rate, speed, roll, pitch）
       MASK:   (T_cam,)  有效帧掩码（首帧或匹配不足置 0）
     """
     rng = np.random.default_rng(seed)
@@ -209,7 +210,7 @@ def simulate_vision_from_trajectory(T_cam, t_cam_idx, yaw, roll, pitch, xy,     
         # 上一帧 / 当前帧的可见点索引（在 Pw 中的全局 id）
         ids_prev = idlists[k-1]; ids_curr = idlists[k]
         # 取交集，实现“真值匹配”
-        common = np.intersected1d(ids_prev, ids_curr) if hasattr(np, "intersected1d") else np.intersect1d(ids_prev, ids_curr)
+        common = np.intersect1d(ids_prev, ids_curr)
         if common.size < min_match:
             MASK[k] = 0.0
             continue
@@ -249,7 +250,7 @@ def simulate_vision_from_trajectory(T_cam, t_cam_idx, yaw, roll, pitch, xy,     
             num_inl / 500.0,                 # 归一化匹配数（500 可按数据量调整）
             float(np.mean(flow)),
             float(np.std(flow)),
-            float(np.linalg.norm(t_rel)),    # 相邻帧基线（单位：相机坐标尺度）
+            float(np.linalg.norm(t_rel)),    # baseline_norm: 相邻帧基线的范数（相机尺度）
             float(yaw_rate_cam[k]),          # 简易 yaw_rate 代理
             float(speed_cam[k]),             # 简易速度代理（像素/帧），可改成物理速度
             float(roll_cam[k]),
@@ -501,14 +502,21 @@ def make_splits(out_dir: Path,
     np.savez(synth_vis_dir/"test.npz",  X_vis=Xv_te, E_vis=Ev_te, mask_vis=Mv_te, seg_id=seg_id_test)
 
 def main():
-    ap = argparse.ArgumentParser("One-shot sim: ACC/GYR/VIS from a shared bicycle trajectory (two-quantity supervision)")
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--traj_duration_s", type=float, default=600.0)
-    ap.add_argument("--rate_hz", type=float, default=100.0)
-    ap.add_argument("--train_routes", type=int, default=8)
-    ap.add_argument("--val_routes", type=int, default=2)
-    ap.add_argument("--test_routes", type=int, default=2)
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=str, default=None, help="YAML/JSON 配置文件（读取 vis 段）")
+    args_pre, _ = pre.parse_known_args()
+
+    cfg = load_config_file(args_pre.config)
+    vis = cfg.get("vis", {})
+
+    ap = argparse.ArgumentParser("One-shot sim: ACC/GYR/VIS from a shared bicycle trajectory (two-quantity supervision)", parents=[pre])
+    ap.add_argument("--out", required=(vis.get("out") is None), default=vis.get("out"))
+    ap.add_argument("--seed", type=int, default=vis.get("seed", 42))
+    ap.add_argument("--traj_duration_s", type=float, default=vis.get("traj_duration_s", 600.0))
+    ap.add_argument("--rate_hz", type=float, default=vis.get("rate_hz", 100.0))
+    ap.add_argument("--train_routes", type=int, default=vis.get("train_routes", 8))
+    ap.add_argument("--val_routes", type=int, default=vis.get("val_routes", 2))
+    ap.add_argument("--test_routes", type=int, default=vis.get("test_routes", 2))
 
     # 物理
     ap.add_argument("--use_slip", action="store_true")
@@ -529,18 +537,18 @@ def main():
     ap.add_argument("--gyr_ma", type=int, default=51)
 
     # 视觉
-    ap.add_argument("--cam_rate_hz", type=float, default=20.0)
-    ap.add_argument("--img_w", type=int, default=640)
-    ap.add_argument("--img_h", type=int, default=480)
-    ap.add_argument("--fx", type=float, default=400.0)
-    ap.add_argument("--fy", type=float, default=400.0)
-    ap.add_argument("--cx", type=float, default=320.0)
-    ap.add_argument("--cy", type=float, default=240.0)
-    ap.add_argument("--vis_window", type=int, default=64)
-    ap.add_argument("--vis_stride", type=int, default=32)
-    ap.add_argument("--noise_px", type=float, default=0.5)
-    ap.add_argument("--outlier_ratio", type=float, default=0.1)
-    ap.add_argument("--min_match", type=int, default=20)
+    ap.add_argument("--cam_rate_hz", type=float, default=vis.get("cam_rate_hz", 20.0))
+    ap.add_argument("--img_w", type=int, default=vis.get("img_w", 640))
+    ap.add_argument("--img_h", type=int, default=vis.get("img_h", 480))
+    ap.add_argument("--fx", type=float, default=vis.get("fx", 400.0))
+    ap.add_argument("--fy", type=float, default=vis.get("fy", 400.0))
+    ap.add_argument("--cx", type=float, default=vis.get("cx", 320.0))
+    ap.add_argument("--cy", type=float, default=vis.get("cy", 240.0))
+    ap.add_argument("--vis_window", type=int, default=vis.get("vis_window", 64))
+    ap.add_argument("--vis_stride", type=int, default=vis.get("vis_stride", 32))
+    ap.add_argument("--noise_px", type=float, default=vis.get("noise_px", 0.5))
+    ap.add_argument("--outlier_ratio", type=float, default=vis.get("outlier_ratio", 0.1))
+    ap.add_argument("--min_match", type=int, default=vis.get("min_match", 20))
 
     args = ap.parse_args()
 
