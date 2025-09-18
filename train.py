@@ -8,8 +8,8 @@ from torch.optim import AdamW
 from utils import seed_everything, to_device, count_params, load_config_file
 from dataset import build_loader
 from models import IMURouteModel
-from losses import nll_iso3_e2, mse_anchor_1d
-from metrics import route_metrics
+from losses import nll_iso3_e2, nll_iso2_e2, mse_anchor_1d
+from metrics import route_metrics_imu, route_metrics_vis
 
 def parse_args():
     pre = argparse.ArgumentParser(add_help=False)
@@ -22,7 +22,7 @@ def parse_args():
     rt = cfg.get("runtime", {})
 
     ap = argparse.ArgumentParser("Train single-route IMU variance model", parents=[pre])
-    ap.add_argument("--route", choices=["acc","gyr"], required=(tr.get("route") is None), default=tr.get("route"), help="Which route to train")
+    ap.add_argument("--route", choices=["acc","gyr","vis"], default=tr.get("route","acc"), help="Which route to train")
     ap.add_argument("--train_npz", required=(tr.get("train_npz") is None), default=tr.get("train_npz"))
     ap.add_argument("--val_npz", required=(tr.get("val_npz") is None), default=tr.get("val_npz"))
     ap.add_argument("--test_npz", required=(tr.get("test_npz") is None), default=tr.get("test_npz"))
@@ -62,7 +62,10 @@ def main():
                                       batch_size=args.batch_size, shuffle=False,
                                       num_workers=args.num_workers)
 
-    d_in = train_ds.X_all.shape[-1] if args.x_mode=="both" else 3
+    if args.route == "vis":
+        d_in = train_ds.X_all.shape[-1]
+    else:
+        d_in = train_ds.X_all.shape[-1] if args.x_mode=="both" else 3
     model = IMURouteModel(d_in=d_in, d_model=args.d_model, n_tcn=args.n_tcn, kernel_size=args.kernel_size,
                           n_layers_tf=args.n_layers_tf, n_heads=args.n_heads, dropout=args.dropout).to(args.device)
     print(f"[model] params={count_params(model):,}  d_in={d_in}")
@@ -80,10 +83,14 @@ def main():
             batch = to_device(batch, args.device)
             x, m, y = batch["X"], batch["MASK"], batch["Y"]
             logv = model(x)
-            loss = nll_iso3_e2(batch["E2"], logv, m,
-                                logv_min=args.logv_min, logv_max=args.logv_max)
-            if args.anchor_weight > 0:
-                loss = loss + mse_anchor_1d(logv, y, m, lam=args.anchor_weight)
+            if args.route == "vis":
+                loss = nll_iso2_e2(batch["E2"], logv, m,
+                                   logv_min=args.logv_min, logv_max=args.logv_max)
+            else:
+                loss = nll_iso3_e2(batch["E2"], logv, m,
+                                   logv_min=args.logv_min, logv_max=args.logv_max)
+                if args.anchor_weight > 0:
+                    loss = loss + mse_anchor_1d(logv, y, m, lam=args.anchor_weight)
             if training:
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
@@ -104,11 +111,14 @@ def main():
             val_batch = next(iter(val_dl))
             val_batch = to_device(val_batch, args.device)
             logv = model(val_batch["X"])
-            stats = route_metrics(val_batch["E2"], logv, val_batch["MASK"], args.logv_min, args.logv_max)
+            if args.route == "vis":
+                stats = route_metrics_vis(val_batch["E2"], logv, val_batch["MASK"], args.logv_min, args.logv_max)
+            else:
+                stats = route_metrics_imu(val_batch["E2"], logv, val_batch["MASK"], args.logv_min, args.logv_max)
 
         print(f"[epoch {epoch:03d}] train_loss={tr_loss:.4f}  val_loss={val_loss:.4f}  "
-              f"ez2={stats['ez2']:.3f} cov68={stats['cov68']:.3f} spear={stats['spear']:.3f} sat={stats['sat']:.3f}  "
-              f"time={time.time()-t0:.1f}s")
+              f"z2_mean={stats['z2_mean']:.3f} cov68={stats['cov68']:.3f} cov95={stats['cov95']:.3f} "
+              f"spear={stats['spear']:.3f} sat={stats['sat']:.3f}  time={time.time()-t0:.1f}s")
 
         if val_loss < best_val:
             best_val = val_loss
@@ -128,7 +138,10 @@ def main():
         test_batch = next(iter(test_dl))
         test_batch = to_device(test_batch, args.device)
         logv = model(test_batch["X"])
-        tst = route_metrics(test_batch["E2"], logv, test_batch["MASK"], args.logv_min, args.logv_max)
+        if args.route == "vis":
+            tst = route_metrics_vis(test_batch["E2"], logv, test_batch["MASK"], args.logv_min, args.logv_max)
+        else:
+            tst = route_metrics_imu(test_batch["E2"], logv, test_batch["MASK"], args.logv_min, args.logv_max)
     with open(Path(args.run_dir)/"final_test_metrics.json","w",encoding="utf-8") as f:
         json.dump(tst, f, ensure_ascii=False, indent=2)
     print("[test]", tst)

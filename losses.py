@@ -19,6 +19,20 @@ def nll_iso3_e2(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
     m = mask.float()
     return (nll * m).sum() / torch.clamp(m.sum(), min=1.0)
 
+def nll_iso2_e2(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
+                logv_min: float = -16.0, logv_max: float = 6.0) -> torch.Tensor:
+    """Isotropic 2D negative log-likelihood for vision route."""
+    if logv.dim() == 3 and logv.size(-1) == 1:
+        logv = logv.squeeze(-1)
+    if e2sum.dim() == 3 and e2sum.size(-1) == 1:
+        e2sum = e2sum.squeeze(-1)
+    logv = torch.clamp(logv, min=logv_min, max=logv_max)
+    v = torch.exp(logv)
+    m = mask.float()
+    nll = 0.5 * (2.0 * logv + e2sum / v)
+    return (nll * m).sum() / torch.clamp(m.sum(), min=1.0)
+
+
 def mse_anchor_1d(logv: torch.Tensor, y_var: torch.Tensor, mask: torch.Tensor, lam: float=1e-3) -> torch.Tensor:
     """
     Optional scale anchor on log-variance.

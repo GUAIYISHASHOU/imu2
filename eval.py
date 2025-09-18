@@ -5,7 +5,7 @@ import torch
 from utils import to_device, load_config_file
 from dataset import build_loader
 from models import IMURouteModel
-from metrics import route_metrics
+from metrics import route_metrics_imu, route_metrics_vis
 
 def parse_args():
     pre = argparse.ArgumentParser(add_help=False)
@@ -17,7 +17,7 @@ def parse_args():
     rt = cfg.get("runtime", {})
 
     ap = argparse.ArgumentParser("Evaluate a trained single-route model", parents=[pre])
-    ap.add_argument("--route", choices=["acc","gyr"], required=(ev.get("route") is None), default=ev.get("route"))
+    ap.add_argument("--route", choices=["acc","gyr","vis"], default=ev.get("route","acc"))
     ap.add_argument("--npz", required=(ev.get("npz") is None), default=ev.get("npz"))
     ap.add_argument("--model", required=(ev.get("model") is None), default=ev.get("model"))
     ap.add_argument("--x_mode", choices=["both","route_only"], default=ev.get("x_mode","both"))
@@ -28,7 +28,10 @@ def main():
     args = parse_args()
     ds, dl = build_loader(args.npz, route=args.route, x_mode=args.x_mode, batch_size=64, shuffle=False, num_workers=0)
 
-    d_in = ds.X_all.shape[-1] if args.x_mode=="both" else 3
+    if args.route == "vis":
+        d_in = ds.X_all.shape[-1]
+    else:
+        d_in = ds.X_all.shape[-1] if args.x_mode=="both" else 3
     ckpt = torch.load(args.model, map_location="cpu")
     md_args = ckpt.get("args", {})
     model = IMURouteModel(d_in=d_in,
@@ -46,10 +49,16 @@ def main():
         for batch in dl:
             batch = to_device(batch, args.device)
             logv = model(batch["X"])
-            st = route_metrics(batch["E2"], logv, batch["MASK"], 
-                               logv_min=md_args.get("logv_min",-12.0), 
-                               logv_max=md_args.get("logv_max",6.0),
-                               yvar=batch.get("Y", None))
+            if args.route == "vis":
+                st = route_metrics_vis(batch["E2"], logv, batch["MASK"],
+                                     logv_min=md_args.get("logv_min",-12.0),
+                                     logv_max=md_args.get("logv_max",6.0),
+                                     yvar=batch.get("Y", None))
+            else:
+                st = route_metrics_imu(batch["E2"], logv, batch["MASK"],
+                                     logv_min=md_args.get("logv_min",-12.0),
+                                     logv_max=md_args.get("logv_max",6.0),
+                                     yvar=batch.get("Y", None))
             all_stats.append(st)
 
     # Average

@@ -1,7 +1,6 @@
 from __future__ import annotations
 import argparse, os
 from pathlib import Path
-import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
@@ -11,7 +10,7 @@ from models import IMURouteModel
 
 def parse_args():
     ap = argparse.ArgumentParser("Save diagnostics plots for a single-route model")
-    ap.add_argument("--route", choices=["acc","gyr"], required=True)
+    ap.add_argument("--route", choices=["acc","gyr","vis"], required=True)
     ap.add_argument("--npz", required=True)
     ap.add_argument("--model", required=True)
     ap.add_argument("--x_mode", choices=["both","route_only"], default="both")
@@ -24,7 +23,10 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     ds, dl = build_loader(args.npz, route=args.route, x_mode=args.x_mode, batch_size=64, shuffle=False, num_workers=0)
 
-    d_in = ds.X_all.shape[-1] if args.x_mode=="both" else 3
+    if args.route == "vis":
+        d_in = ds.X_all.shape[-1]
+    else:
+        d_in = ds.X_all.shape[-1] if args.x_mode=="both" else 3
     ckpt = torch.load(args.model, map_location="cpu")
     md_args = ckpt.get("args", {})
     model = IMURouteModel(d_in=d_in,
@@ -40,19 +42,28 @@ def main():
     with torch.no_grad():
         batch = next(iter(dl))
         batch = to_device(batch, args.device)
-        logv = model(batch["X"]).squeeze(-1)
+        logv = model(batch["X"])
+        if logv.dim() == 3 and logv.size(-1) == 1:
+            logv = logv.squeeze(-1)
         var = torch.exp(logv)
-        e2sum = batch["E2"].squeeze(-1)
-        z2 = (e2sum / var) / 3.0
-        m = batch["MASK"].float()
-        mask_flat = (m > 0.5)
+        e2sum = batch["E2"]
+        if e2sum.dim() == 3 and e2sum.size(-1) == 1:
+            e2sum = e2sum.squeeze(-1)
+        mask = batch["MASK"]
+        if mask.dim() == 3 and mask.size(-1) == 1:
+            mask = mask.squeeze(-1)
+        mask = mask.float()
+        df = 2.0 if args.route == "vis" else 3.0
+        z2 = (e2sum / var) / df
+        mask_flat = mask > 0.5
 
         # Plot 1: histogram of z^2
         z2_np = z2[mask_flat].detach().cpu().numpy().reshape(-1)
         plt.figure()
         plt.hist(z2_np, bins=100)
-        plt.title(f"z^2 (normalized by df=3) — route={args.route}")
-        plt.xlabel("z^2"); plt.ylabel("count")
+        plt.title(f"z^2 (df={int(df)}) - route={args.route}")
+        plt.xlabel("z^2")
+        plt.ylabel("count")
         plt.tight_layout()
         plt.savefig(os.path.join(args.out, "hist_z2.png"))
         plt.close()
@@ -62,8 +73,9 @@ def main():
         vv = var[mask_flat].detach().cpu().numpy().reshape(-1)
         plt.figure()
         plt.scatter(es, vv, s=4, alpha=0.5)
-        plt.xlabel("pooled err^2"); plt.ylabel("pred var")
-        plt.title(f"Scatter pooled err^2 vs var — route={args.route}")
+        plt.xlabel("pooled err^2")
+        plt.ylabel("pred var")
+        plt.title(f"Scatter pooled err^2 vs var - route={args.route}")
         plt.tight_layout()
         plt.savefig(os.path.join(args.out, "scatter_err2_vs_var.png"))
         plt.close()
@@ -75,8 +87,9 @@ def main():
         plt.figure()
         for i in range(K):
             plt.plot(lv[i], label=f"seq{i}")
-        plt.title(f"log variance (first {K} seqs) — route={args.route}")
-        plt.xlabel("t"); plt.ylabel("log(var)")
+        plt.title(f"log variance (first {K} seqs) - route={args.route}")
+        plt.xlabel("t")
+        plt.ylabel("log(var)")
         plt.tight_layout()
         plt.savefig(os.path.join(args.out, "timeseries_logvar.png"))
         plt.close()

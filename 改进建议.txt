@@ -1,27 +1,72 @@
-下面这 4 件事补齐后，就可以直接开跑：
+1) losses.py：保留 IMU 原函数，新增视觉专用
+# --- 现有的（IMU 用，3 维）原样保留 ---
+def nll_iso3_e2(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
+                logv_min: float = -16.0, logv_max: float = 6.0) -> torch.Tensor:
+    logv = torch.clamp(logv, min=logv_min, max=logv_max)
+    v = torch.exp(logv)
+    nll = 0.5 * (3.0 * logv + e2sum / v)
+    m = mask.float()
+    return (nll * m).sum() / torch.clamp(m.sum(), min=1.0)
 
-train.py 增加 route=vis 分支
+# --- 新增：视觉专用（2 维）---
+def nll_iso2_e2(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
+                logv_min: float = -16.0, logv_max: float = 6.0) -> torch.Tensor:
+    logv = torch.clamp(logv, min=logv_min, max=logv_max)
+    v = torch.exp(logv)
+    nll = 0.5 * (2.0 * logv + e2sum / v)
+    m = mask.float()
+    return (nll * m).sum() / torch.clamp(m.sum(), min=1.0)
 
-选择视觉专用模型（2 维输出），比如我们前面给你的 VisionVarNet；
+2) metrics.py：分别计算 z²（IMU÷3，VIS÷2）
+@torch.no_grad()
+def route_metrics_imu(e2sum, logv, mask, logv_min, logv_max):
+    logv = torch.clamp(logv, logv_min, logv_max)
+    var  = torch.clamp(torch.exp(logv), min=1e-12)
+    m    = mask.float()
+    z2   = (e2sum / var) / 3.0
+    return {
+        "z2_mean": (z2*m).sum() / torch.clamp(m.sum(), 1.0),
+        "cov68":  ((z2.sqrt() <= 1.0)*m).sum() / torch.clamp(m.sum(), 1.0),
+        "cov95":  ((z2.sqrt() <= 2.0)*m).sum() / torch.clamp(m.sum(), 1.0),
+    }
 
-loss 用 Gaussian NLL 或 Student-t（仅对 mask_vis==1 计损失）。
+@torch.no_grad()
+def route_metrics_vis(e2sum, logv, mask, logv_min, logv_max):
+    logv = torch.clamp(logv, logv_min, logv_max)
+    var  = torch.clamp(torch.exp(logv), min=1e-12)
+    m    = mask.float()
+    z2   = (e2sum / var) / 2.0
+    return {
+        "z2_mean": (z2*m).sum() / torch.clamp(m.sum(), 1.0),
+        "cov68":  ((z2.sqrt() <= 1.0)*m).sum() / torch.clamp(m.sum(), 1.0),
+        "cov95":  ((z2.sqrt() <= 2.0)*m).sum() / torch.clamp(m.sum(), 1.0),
+    }
 
-dataset.py 支持视觉键
+3) train.py：route 分支各走各的损失与指标（IMU 不改）
+# argparse 增加：
+ap.add_argument("--route", choices=["acc","gyr","vis"], default="acc")
 
-从 npz 读 X_vis (T,D) / E_vis (T,2) / mask_vis (T,2)；
+# 训练/验证处：
+if args.route in ("acc","gyr"):
+    loss = nll_iso3_e2(batch["E2"], logv, batch["MASK"],
+                       logv_min=args.logv_min, logv_max=args.logv_max)
+    stats = route_metrics_imu(val_batch["E2"], logv, val_batch["MASK"],
+                              args.logv_min, args.logv_max)
+else:  # vis
+    loss = nll_iso2_e2(batch["E2"], logv, batch["MASK"],
+                       logv_min=args.logv_min, logv_max=args.logv_max)
+    stats = route_metrics_vis(val_batch["E2"], logv, val_batch["MASK"],
+                              args.logv_min, args.logv_max)
 
-若同目录存在 vis_meta.json 就用其中的 mean/std 做标准化；否则只在 train 上统计，val/test 冻结。
+4) eval.py / analyze.py：同理按 route 选择 df
+ap.add_argument("--route", choices=["acc","gyr","vis"], required=True)
 
-gen_bicycle_dual_vis.py 落盘元数据
+if args.route in ("acc","gyr"):
+    stats = route_metrics_imu(batch["E2"], logv, batch["MASK"],
+                              logv_min=md.get("logv_min",-12), logv_max=md.get("logv_max",6))
+else:
+    stats = route_metrics_vis(batch["E2"], logv, batch["MASK"],
+                              logv_min=md.get("logv_min",-12), logv_max=md.get("logv_max",6))
 
-写出 data/synth_vis/vis_meta.json（单位=px、feature_names、standardize 的 mean/std、seed 与段落配额）；
 
-写出 seg_id_{train,val,test}.npy 或把 seg_id 内嵌到各自 npz。
-（README 里目前看不到这两样，建议纳入版本控制。）
-GitHub
-
-eval.py / analyze.py 加 route=vis
-
-评测时计算视觉 2 维的 E[z²]、cov68/95；
-
-画三图：z² 直方图（df=2）、err² vs var 散点、logvar 时序。
+这样做的好处：IMU 的训练/评测路径完全不变（继续用 nll_iso3_e2 + df=3），视觉走独立的损失与指标（nll_iso2_e2 + df=2）。命令行只需 --route vis 才会走视觉逻辑，避免混用。

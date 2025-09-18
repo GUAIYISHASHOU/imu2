@@ -21,8 +21,10 @@ class IMURouteDataset(Dataset):
         self.npz_path = str(npz_path)
         self.route = route
         self.x_mode = x_mode
-        assert route in ("acc","gyr")
+        assert route in ("acc","gyr","vis")
         assert x_mode in ("both","route_only")
+        if self.route == "vis" and self.x_mode != "both":
+            raise ValueError("Vision route only supports x_mode='both'")
 
         data = np.load(self.npz_path, allow_pickle=True)
         X = _get(data, ["X","X_imu_seq","imu_seq","imu"], None)
@@ -76,7 +78,7 @@ class IMURouteDataset(Dataset):
             Y = self.Y_acc[idx] if self.Y_acc is not None else None
             if self.x_mode == "route_only" and X.shape[-1] >= 6:
                 X = X[..., :3]
-        else:
+        elif self.route == "gyr":
             if E2.shape[-1] == 1:
                 E2_route = E2
             elif E2.shape[-1] >= 2:
@@ -86,6 +88,9 @@ class IMURouteDataset(Dataset):
             Y = self.Y_gyr[idx] if self.Y_gyr is not None else None
             if self.x_mode == "route_only" and X.shape[-1] >= 6:
                 X = X[..., 3:6]
+        else:
+            E2_route = E2[..., :1] if E2.shape[-1] >= 1 else E2
+            Y = None
 
         out = {
             "X": torch.from_numpy(X),
