@@ -48,7 +48,8 @@ def main():
             logv = model(batch["X"])
             st = route_metrics(batch["E2"], logv, batch["MASK"], 
                                logv_min=md_args.get("logv_min",-12.0), 
-                               logv_max=md_args.get("logv_max",6.0))
+                               logv_max=md_args.get("logv_max",6.0),
+                               yvar=batch.get("Y", None))
             all_stats.append(st)
 
     # Average

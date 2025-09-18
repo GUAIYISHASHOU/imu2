@@ -32,11 +32,11 @@ bicycle:
 
 # Training configuration (used by train.py)
 train:
-  route: acc               # acc or gyr
-  train_npz: data_cache/train_acc.npz
-  val_npz: data_cache/val_acc.npz
-  test_npz: data_cache/test_acc.npz
-  run_dir: runs/acc
+  route: gyr               # acc or gyr
+  train_npz: data_cache/train_gyr.npz
+  val_npz: data_cache/val_gyr.npz
+  test_npz: data_cache/test_gyr.npz
+  run_dir: runs/gyr
   epochs: 300
   batch_size: 32
   lr: 0.001
@@ -63,5 +63,5 @@ runtime:
 # Evaluation (used by eval.py)
 eval:
   route: acc
-  npz: data/synth/test.npz
+  npz: data_cache/test_acc.npz
   model: runs/acc/best.pt
