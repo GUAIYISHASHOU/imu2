@@ -3,6 +3,7 @@
 from __future__ import annotations
 import argparse
 from pathlib import Path
+import json
 import numpy as np
 
 # -------------------- 线性代数小工具 --------------------
@@ -298,6 +299,30 @@ def make_splits(out_dir: Path,
             return np.diff(x_long, axis=0, prepend=x_long[:1]).astype(np.float32)
         raise ValueError(mode)
 
+    # ---- 轻量告警/元数据 ----
+    def warn(msg):
+        print(f"[vis-gen][WARN] {msg}")
+
+    def approx_unit_check_flow(flow_mean_px, tag="flow_mean"):
+        med = float(np.median(np.abs(flow_mean_px)))
+        if med < 0.02:
+            warn(f"{tag} median≈{med:.4f} px, 像素量级过小，是否被归一化？")
+        if med > 20.0:
+            warn(f"{tag} median≈{med:.2f} px, 过大；检查焦距/单位混用")
+
+    def write_vis_meta(out_dir_meta: Path):
+        meta = {
+            "unit": "px",
+            "feature_names": [
+                "num_inlier_norm","flow_mag_mean","flow_mag_std","baseline_m",
+                "yaw_rate","speed_proxy","roll","pitch"
+            ],
+            "quantile_triplets": [],
+            "standardize": {"enable": False, "mean": None, "std": None},
+        }
+        out_dir_meta.mkdir(parents=True, exist_ok=True)
+        (out_dir_meta / "vis_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+
     def one_split(num_routes, split_name, seed_base):
         dt = 1.0 / rate_hz
         T_long = int(round(traj_duration_s * rate_hz))
@@ -312,6 +337,7 @@ def make_splits(out_dir: Path,
         Xa_list,Ea_list,Ma_list,YAa_list = [],[],[],[]
         Xg_list,Eg_list,Mg_list,YGg_list = [],[],[],[]
         Xv_list,Ev_list,Mv_list = [],[],[]
+        seg_list = []  # (per-route) camera timeline labels
 
         for r in range(num_routes):
             seed_r = seed_base + r
@@ -331,6 +357,29 @@ def make_splits(out_dir: Path,
                 T_cam, t_cam_idx, yaw, roll, pitch, xy, K, (img_w,img_h), Pw,
                 noise_px=noise_px, outlier_ratio=outlier_ratio, min_match=min_match, seed=seed_r+999
             )
+
+            # ---- 轻量自检与段标 ----
+            # 单位量级检查（基于光流均值，像素）
+            approx_unit_check_flow(X_vis[:,1], tag=f"{split_name}/route{r}/flow_mean")
+            # 段落标注（启发式）：1=纯旋(转动大/基线小)，2=弱视差(流量小&基线小)，3=内点下降(内点比小)
+            seg_id = np.zeros((T_cam,), dtype=np.int32)
+            baseline = X_vis[:,3]
+            yaw_rate = np.abs(X_vis[:,4])
+            flow_mean= X_vis[:,1]
+            inlier_norm = X_vis[:,0]
+            # 阈值用分位数适配
+            b_small = np.quantile(baseline, 0.1) if T_cam>0 else 0.0
+            f_small = np.quantile(flow_mean, 0.1) if T_cam>0 else 0.0
+            ir_small= np.quantile(inlier_norm, 0.1) if T_cam>0 else 0.0
+            rot_ratio = yaw_rate / (baseline + 1e-6)
+            rr_big = np.quantile(rot_ratio, 0.9) if T_cam>0 else 1e9
+            # 标注（优先级：内点下降>纯旋>弱视差）
+            seg_id[inlier_norm <= ir_small] = 3
+            mask_free = seg_id == 0
+            seg_id[(rot_ratio >= rr_big) & mask_free] = 1
+            mask_free = seg_id == 0
+            seg_id[((baseline <= b_small) & (flow_mean <= f_small)) & mask_free] = 2
+            seg_list.append(seg_id.astype(np.int32))
 
             # ---- IMU 分路：ACC ----
             Xa_long = preprocess(X_imu[:, :3], acc_preproc, acc_ma)
@@ -371,6 +420,10 @@ def make_splits(out_dir: Path,
         Ev  = np.concatenate(Ev_list,0).astype(np.float32)
         Mv  = np.concatenate(Mv_list,0).astype(np.float32)
 
+        # 写出分割标签（相机时间轴，按 route 级拼接）
+        seg_all = np.concatenate(seg_list, axis=0) if len(seg_list)>0 else np.zeros((0,),np.int32)
+        np.save(out_dir / f"{split_name}_seg_id.npy", seg_all.astype(np.int32))
+
         print(f"[{split_name}] routes={num_routes} | ACC windows={Xa.shape[0]} | GYR windows={Xg.shape[0]} | VIS windows={Xv.shape[0]}")
         return (Xa,Ea,Ma,YAa),(Xg,Eg,Mg,YGg),(Xv,Ev,Mv)
 
@@ -389,6 +442,9 @@ def make_splits(out_dir: Path,
         np.savez(out_dir/f"{prefix}_acc.npz", X=Xa, E2=Ea, MASK=Ma, Y_ACC=YAa)
         np.savez(out_dir/f"{prefix}_gyr.npz", X=Xg, E2=Eg, MASK=Mg, Y_GYR=YGg)
         np.savez(out_dir/f"{prefix}_vis.npz", X=Xv, E2=Ev, MASK=Mv)
+
+    # 写一次元数据
+    write_vis_meta(out_dir)
 
     savetag("train", acc_tr, gyr_tr, vis_tr)
     savetag("val",   acc_va, gyr_va, vis_va)
