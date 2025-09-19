@@ -27,11 +27,11 @@ bicycle:
 
 # Training configuration (train.py)
 train:
-  route: gyr
-  train_npz: data_cache/train_gyr.npz
-  val_npz: data_cache/val_gyr.npz
-  test_npz: data_cache/test_gyr.npz
-  run_dir: runs/gyr
+  route: acc
+  train_npz: data_vis/train_acc.npz
+  val_npz: data_vis/val_acc.npz
+  test_npz: data_vis/test_acc.npz
+  run_dir: runs/vis
   epochs: 300
   batch_size: 32
   lr: 0.001
@@ -58,20 +58,20 @@ runtime:
   device: cuda
 
 eval:
-  route: gyr
-  npz: data_cache/test_gyr.npz
-  model: runs/gyr/best.pt
+  route: acc
+  npz: data_vis/test_acc.npz
+  model: runs/vis/best.pt
   x_mode: both
 
 # Visual+IMU generator (gen_bicycle_dual_vis.py)
 vis:
   out: data_vis          
   seed: 42
-  traj_duration_s: 120
+  traj_duration_s: 500
   rate_hz: 100
-  train_routes: 2
-  val_routes: 1
-  test_routes: 1
+  train_routes: 6
+  val_routes: 2
+  test_routes: 2
   cam_rate_hz: 10
   img_w: 640
   img_h: 480
@@ -81,6 +81,6 @@ vis:
   cy: 240.0
   vis_window: 64
   vis_stride: 32
-  noise_px: 0.5
-  outlier_ratio: 0.1
-  min_match: 20
+  noise_px: 0.35
+  outlier_ratio: 0.05
+  min_match: 8

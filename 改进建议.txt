@@ -1,72 +1,84 @@
-1) losses.py：保留 IMU 原函数，新增视觉专用
-# --- 现有的（IMU 用，3 维）原样保留 ---
-def nll_iso3_e2(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
-                logv_min: float = -16.0, logv_max: float = 6.0) -> torch.Tensor:
-    logv = torch.clamp(logv, min=logv_min, max=logv_max)
-    v = torch.exp(logv)
-    nll = 0.5 * (3.0 * logv + e2sum / v)
-    m = mask.float()
-    return (nll * m).sum() / torch.clamp(m.sum(), min=1.0)
+你的 vis_coverage≈0.054 ≈ cam_rate_hz / rate_hz * 某个通过率（10/100≈0.10，再乘上“配对+内点”的通过率 ≈0.5），说明掩码只在相机采样点上为 1，但滑窗是在 100 Hz 的 IMU 时间轴上取的，导致一段 64（IMU tick）长度的窗里只有极少数相机帧是有效的。
 
-# --- 新增：视觉专用（2 维）---
-def nll_iso2_e2(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
-                logv_min: float = -16.0, logv_max: float = 6.0) -> torch.Tensor:
-    logv = torch.clamp(logv, min=logv_min, max=logv_max)
-    v = torch.exp(logv)
-    nll = 0.5 * (2.0 * logv + e2sum / v)
-    m = mask.float()
-    return (nll * m).sum() / torch.clamp(m.sum(), min=1.0)
+一句话结论
 
-2) metrics.py：分别计算 z²（IMU÷3，VIS÷2）
-@torch.no_grad()
-def route_metrics_imu(e2sum, logv, mask, logv_min, logv_max):
-    logv = torch.clamp(logv, logv_min, logv_max)
-    var  = torch.clamp(torch.exp(logv), min=1e-12)
-    m    = mask.float()
-    z2   = (e2sum / var) / 3.0
-    return {
-        "z2_mean": (z2*m).sum() / torch.clamp(m.sum(), 1.0),
-        "cov68":  ((z2.sqrt() <= 1.0)*m).sum() / torch.clamp(m.sum(), 1.0),
-        "cov95":  ((z2.sqrt() <= 2.0)*m).sum() / torch.clamp(m.sum(), 1.0),
-    }
+把 VIS 的滑窗改到“相机时间轴” 上（而不是 IMU 100 Hz 轴），覆盖率会立刻回到 0.6–0.9；或者临时把“有效窗过滤阈值”开起来先训也行。
 
-@torch.no_grad()
-def route_metrics_vis(e2sum, logv, mask, logv_min, logv_max):
-    logv = torch.clamp(logv, logv_min, logv_max)
-    var  = torch.clamp(torch.exp(logv), min=1e-12)
-    m    = mask.float()
-    z2   = (e2sum / var) / 2.0
-    return {
-        "z2_mean": (z2*m).sum() / torch.clamp(m.sum(), 1.0),
-        "cov68":  ((z2.sqrt() <= 1.0)*m).sum() / torch.clamp(m.sum(), 1.0),
-        "cov95":  ((z2.sqrt() <= 2.0)*m).sum() / torch.clamp(m.sum(), 1.0),
-    }
+立刻修：让 VIS 在“相机时间轴”滑窗（最稳妥）
 
-3) train.py：route 分支各走各的损失与指标（IMU 不改）
-# argparse 增加：
-ap.add_argument("--route", choices=["acc","gyr","vis"], default="acc")
+目标：X/E2/MASK 先按相机帧序列构建（长度 = 相机帧数），再用 vis_window/vis_stride 在相机索引上切窗。
 
-# 训练/验证处：
-if args.route in ("acc","gyr"):
-    loss = nll_iso3_e2(batch["E2"], logv, batch["MASK"],
-                       logv_min=args.logv_min, logv_max=args.logv_max)
-    stats = route_metrics_imu(val_batch["E2"], logv, val_batch["MASK"],
-                              args.logv_min, args.logv_max)
-else:  # vis
-    loss = nll_iso2_e2(batch["E2"], logv, batch["MASK"],
-                       logv_min=args.logv_min, logv_max=args.logv_max)
-    stats = route_metrics_vis(val_batch["E2"], logv, val_batch["MASK"],
-                              args.logv_min, args.logv_max)
+在 gen_bicycle_dual_vis.py 里（大致的位置：你生成出按帧的 X_vis_seq, E2_vis_seq, M_vis_seq 之后），把“切窗”那段替换为（示意伪码，变量名照你的代码对上）：
 
-4) eval.py / analyze.py：同理按 route 选择 df
-ap.add_argument("--route", choices=["acc","gyr","vis"], required=True)
+# 假设这里的三个序列都是按“相机帧”的时间轴排好的
+# 形状：X_seq = (N_cam, D), E2_seq = (N_cam, 1), M_seq = (N_cam,)
+N_cam = X_seq.shape[0]
+W, S = vis_window, vis_stride  # 这两个参数继续从 config 里读
 
-if args.route in ("acc","gyr"):
-    stats = route_metrics_imu(batch["E2"], logv, batch["MASK"],
-                              logv_min=md.get("logv_min",-12), logv_max=md.get("logv_max",6))
-else:
-    stats = route_metrics_vis(batch["E2"], logv, batch["MASK"],
-                              logv_min=md.get("logv_min",-12), logv_max=md.get("logv_max",6))
+X_wins, E2_wins, M_wins = [], [], []
+for s in range(0, max(0, N_cam - W + 1), S):
+    e = s + W
+    X_wins.append(X_seq[s:e])
+    E2_wins.append(E2_seq[s:e])
+    M_wins.append(M_seq[s:e])
+
+X_wins = np.stack(X_wins, 0).astype(np.float32)       # (N_win, W, D)
+E2_wins = np.stack(E2_wins, 0).astype(np.float32)     # (N_win, W, 1)
+M_wins  = np.stack(M_wins, 0).astype(np.float32)      # (N_win, W)
+print(f"[{split}] VIS windows={len(X_wins)}  cam_frames={N_cam}  coverage={M_wins.mean():.3f}")
+np.savez(out_dir/f"{split}_vis.npz", X=X_wins, E2=E2_wins, MASK=M_wins)
 
 
-这样做的好处：IMU 的训练/评测路径完全不变（继续用 nll_iso3_e2 + df=3），视觉走独立的损失与指标（nll_iso2_e2 + df=2）。命令行只需 --route vis 才会走视觉逻辑，避免混用。
+这样做后，coverage≈有效相机帧占比，不会再被 100 Hz 的 IMU 轴稀释成 0.05。
+
+如果你现在的实现是先把 MASK 挂到 100 Hz 轴上，再切 100 Hz 的窗，那在 cam_rate_hz=10、vis_window=64 时，理论上 coverage 只能 ≈0.1；再叠加“需要相邻两帧都是相机帧”与“min_match/内点率”门控，很容易掉到 ~0.05——这正是你现在看到的数字。
+
+备选（不改生成流程也能训）：过滤“有效帧太少”的窗
+
+如果你当前不方便改生成器，直接在 dataset.py 的 VIS 分支加“最小可用比例”过滤，也能把训练稳住：
+
+# 载入完 X_all, E2_all, M_all 之后（route=='vis'）
+ratio = self.M_all.mean(axis=1)                 # 每个窗的有效帧占比
+keep  = ratio >= getattr(self, "min_vis_ratio", 0.3)
+self.X_all = self.X_all[keep]
+self.E2_all = self.E2_all[keep]
+self.M_all  = self.M_all[keep]
+print(f"[dataset][vis] keep {keep.sum()}/{len(keep)} windows (min_ratio={getattr(self,'min_vis_ratio',0.3)})")
+
+
+训练时带上：
+
+python train.py --route vis ... --min_vis_ratio 0.3
+
+
+这不会提升“覆盖率”本身，但会丢掉没什么监督信号的窗，收敛和指标会明显稳定。
+
+小排查：确认你的配置真被读到了
+
+在 gen_bicycle_dual_vis.py 读 config.yaml 后，打印以下四个值，防止你改了 YAML 但脚本没用上：
+
+print(f"[cfg] cam_rate_hz={cam_rate_hz}  min_match={min_match}  outlier_ratio={outlier_ratio}  noise_px={noise_px}")
+
+
+如果你已经把 min_match 改到 8、outlier_ratio 改到 0.05，但日志里还是旧值，那就是配置没生效（路径/段名或解析问题）。
+
+不要再把 cam_rate 降低了（在没切到相机轴之前）
+
+之前我建议把 cam_rate_hz: 10 -> 5 是**建立在“VIS 在相机时间轴切窗”**的前提下。当前你的代码还在 IMU 轴切窗的话，降帧率只会进一步降低 coverage。
+所以顺序是：先改为相机轴切窗 → 再考虑把 cam_rate_hz 调到 5 以提高帧间基线和匹配质量。
+
+最后，给一个“定位到底卡在哪”的打印
+
+把这段塞到你计算掩码逻辑的旁边（每帧/每窗统计一次）：
+
+# 仅示意：统计三种数量的中位数（可见点 / 帧间公共ID / RANSAC内点）
+print(f"[{split}/route{r}] med n_vis={np.median(n_visible):.0f}, "
+      f"med n_common={np.median(n_common):.0f}, med n_inlier={np.median(n_inlier):.0f}, "
+      f"coverage={float((M_seq>0.5).mean()):.3f}")
+
+
+med n_common 近 0 → 还是 ID 没对齐（但你说已修）；
+
+med n_common 正常、med n_inlier 很低 → RANSAC/阈值太严；
+
+两者都正常、coverage 仍 ≈ cam_rate/rate_hz * 0.5 → 确实是 IMU 轴切窗的稀释效应。

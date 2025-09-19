@@ -92,20 +92,26 @@ def simulate_imu(T, dt, seed, **phys):
 
     X_imu = np.concatenate([acc_meas, gyr_meas], axis=-1).astype(np.float32)   # (T,6)
     E2_imu= np.stack([np.sum(acc_noise**2,axis=-1), np.sum(gyr_noise**2,axis=-1)], axis=-1).astype(np.float32)  # (T,2)
-    return X_imu, E2_imu, a_var, g_var, roll, pitch, speed
+    
+    # 新增：真值 yaw/xy（用于相机位姿，避免陀螺积分漂移）
+    yaw_true = np.cumsum(gyr_true[:,2]) * dt
+    xy_true  = np.cumsum(np.stack([speed*np.cos(yaw_true), speed*np.sin(yaw_true)], -1), 0) * dt
+    
+    return X_imu, E2_imu, a_var, g_var, roll, pitch, speed, yaw_true, xy_true
 
 # -------------------- 相机/视觉仿真 --------------------
-def sample_landmarks(num=3000, box=(( -80, 80), ( -30, 30), (  2, 80)), seed=0):
+def sample_landmarks(num=4000, seed=0, x_max=80.0, y_half=30.0, z_range=(-1.0,3.0)):
     """
-    均匀撒点（世界系），默认在车前方一个长盒子里（避免身后无意义点）
-    z in [2, 80] 表示“前方距离”近远
+    均匀撒点（世界系），在车前方一个长盒子里（避免身后无意义点）
+    x in [2, x_max] 表示"前方距离"（沿 +x）
+    y in [-y_half, y_half] 表示"左右分布"（沿 y）
+    z in z_range 表示"地面附近高度"（沿 z，上下）
     """
     rng = np.random.default_rng(seed)
-    xs = rng.uniform(box[0][0], box[0][1], size=num)
-    ys = rng.uniform(box[1][0], box[1][1], size=num)
-    zs = rng.uniform(box[2][0], box[2][1], size=num)
-    Pw = np.stack([xs, ys, zs], axis=-1).astype(np.float32)  # (N,3)
-    return Pw
+    xs = rng.uniform(  2, x_max, size=num)     # ← 用 x_max 代替固定 80
+    ys = rng.uniform(-y_half, y_half, size=num)
+    zs = rng.uniform( z_range[0], z_range[1], size=num)
+    return np.stack([xs, ys, zs], axis=-1).astype(np.float32)
 
 def camera_poses_from_imu(yaw, roll, pitch, trans_xy, z_height,
                           R_cb=np.eye(3,dtype=np.float32), t_cb=np.zeros(3,np.float32)):
@@ -117,34 +123,40 @@ def camera_poses_from_imu(yaw, roll, pitch, trans_xy, z_height,
     Rc_list = []
     tc_list = []
     for k in range(T):
-        Rwb = rot_z(yaw[k]) @ rot_y(pitch[k]) @ rot_x(roll[k])   # world->body
-        Rwc = Rwb @ R_cb                                         # world->cam
-        pwb = np.array([trans_xy[k,0], trans_xy[k,1], z_height], np.float32)
-        pwc = pwb + Rwb @ t_cb                                   # cam center in world
-        Rcw = Rwc.T
-        tcw = -Rcw @ pwc
-        Rc_list.append(Rcw)
-        tc_list.append(tcw.astype(np.float32))
+        R_wb = rot_z(yaw[k]) @ rot_y(pitch[k]) @ rot_x(roll[k])   # body->world ✅
+        R_bw = R_wb.T
+        R_cw = R_cb @ R_bw                                        # world->cam ✅
+        p_wb = np.array([trans_xy[k,0], trans_xy[k,1], z_height], np.float32)
+        p_wc = p_wb + R_wb @ t_cb                                 # cam center (world)
+        t_cw = -R_cw @ p_wc                                       # ✅
+        Rc_list.append(R_cw)
+        tc_list.append(t_cw.astype(np.float32))
     return np.stack(Rc_list,0), np.stack(tc_list,0)  # (T,3,3),(T,3)
 
 def project_points(Pw, Rcw, tcw, K, img_wh, noise_px=0.5, rng=None):
     """
-    把世界点投到像素系，返回可见点及像素。
+    把世界点投到像素系，返回：
+      uv_noisy: (M,2)
+      ids_global: (M,) 对应 Pw 的全局下标
+      Pc: (M,3) 可见三维点在相机坐标系下的坐标
     """
-    if rng is None: rng = np.random.default_rng(0)
-    Pc = (Rcw @ Pw.T).T + tcw   # (N,3)
-    Z = Pc[:,2]
-    vis = Z > 0.3
-    Pc = Pc[vis]
-    if Pc.shape[0]==0:
-        return np.zeros((0,2),np.float32), np.zeros((0,),bool), np.zeros((0,3),np.float32)
-    uv = (K @ (Pc.T / Pc[:,2])).T[:, :2]  # 像素
+    if rng is None:
+        rng = np.random.default_rng(0)
+    Pc_all = (Rcw @ Pw.T).T + tcw
+    Z = Pc_all[:, 2]
+    vis_mask = Z > 0.3
+    # 对所有点投影，再用可见/在图像内的掩码过滤，确保可回到全局下标
+    uv_all = (K @ (Pc_all.T / np.clip(Z, 1e-6, None))).T[:, :2]
     W, H = img_wh
-    in_img = (uv[:,0] >= 0) & (uv[:,0] < W) & (uv[:,1] >= 0) & (uv[:,1] < H)
-    uv = uv[in_img]
-    Pc = Pc[in_img]
+    in_img = (uv_all[:, 0] >= 0) & (uv_all[:, 0] < W) & (uv_all[:, 1] >= 0) & (uv_all[:, 1] < H)
+    global_mask = vis_mask & in_img
+    if not np.any(global_mask):
+        return np.zeros((0, 2), np.float32), np.zeros((0,), np.int32), np.zeros((0, 3), np.float32)
+    ids_global = np.where(global_mask)[0]
+    uv = uv_all[global_mask]
+    Pc = Pc_all[global_mask]
     uv_noisy = uv + rng.normal(scale=noise_px, size=uv.shape).astype(np.float32)
-    return uv_noisy.astype(np.float32), in_img.nonzero()[0], Pc.astype(np.float32)
+    return uv_noisy.astype(np.float32), ids_global.astype(np.int32), Pc.astype(np.float32)
 
 def sampson_dist(x1n, x2n, E):
     """
@@ -160,7 +172,7 @@ def sampson_dist(x1n, x2n, E):
     den = Ex1[:,0]**2 + Ex1[:,1]**2 + Etx2[:,0]**2 + Etx2[:,1]**2 + 1e-12
     return (num / den).astype(np.float32)  # (M,)
 
-def simulate_vision_from_trajectory(T_cam, t_cam_idx, yaw, roll, pitch, xy,     # 轨迹（下采样到相机时刻的索引）
+def simulate_vision_from_trajectory(T_cam, t_cam_idx, yaw, roll, pitch, xy, speed, dt_cam,   # 轨迹（下采样到相机时刻的索引）
                                     K, img_wh, Pw, noise_px=0.5, outlier_ratio=0.1,
                                     min_match=20, seed=0):
     """
@@ -171,8 +183,10 @@ def simulate_vision_from_trajectory(T_cam, t_cam_idx, yaw, roll, pitch, xy,     
       MASK:   (T_cam,)  有效帧掩码（首帧或匹配不足置 0）
     """
     rng = np.random.default_rng(seed)
-    # 相机外参（默认与体坐标重合，可按需改）
-    R_cb = np.eye(3, dtype=np.float32)
+    # 相机外参：车体x(前进)→相机z(光轴), 车体y(左)→相机-x(右), 车体z(上)→相机-y(下)
+    R_cb = np.array([[ 0, -1,  0],
+                     [ 0,  0, -1],
+                     [ 1,  0,  0]], dtype=np.float32)  # 让相机z沿车体+x
     t_cb = np.zeros(3, dtype=np.float32)
     # 相机位姿（世界->相机）
     Rcw_all, tcw_all = camera_poses_from_imu(yaw[t_cam_idx], roll[t_cam_idx], pitch[t_cam_idx],
@@ -194,13 +208,12 @@ def simulate_vision_from_trajectory(T_cam, t_cam_idx, yaw, roll, pitch, xy,     
     X_vis  = np.zeros((T_cam,8), np.float32)  # 8D 状态特征
     MASK   = np.zeros(T_cam, np.float32)
 
-    # 临时：构造 yaw_rate/speed/roll/pitch（简单差分/带入外部）
-    # 这里假设外部传进来的是 100Hz 的 yaw/speed/roll/pitch（与 IMU 同频）；我们用相机索引取子序列
-    # yaw_rate: 差分（相机频率上）
-    yaw_cam = yaw[t_cam_idx]; speed_cam = np.gradient(xy[t_cam_idx,0], edge_order=1) * 0  # 占位，后面替换
-    xy_cam = xy[t_cam_idx]
-    speed_cam = np.linalg.norm(np.diff(xy_cam, axis=0, prepend=xy_cam[:1]), axis=1)  # 粗略速度像素/帧
-    yaw_rate_cam = np.diff(yaw_cam, prepend=yaw_cam[:1]) / max(1, (t_cam_idx[1]-t_cam_idx[0]))
+    # 构造 yaw_rate/speed/roll/pitch（按相机时刻子采样）
+    yaw_cam = yaw[t_cam_idx]
+    # yaw_rate in rad/s using actual camera interval
+    yaw_rate_cam = np.diff(yaw_cam, prepend=yaw_cam[:1]) / max(1e-6, dt_cam)
+    # true speed at camera timestamps (m/s)
+    speed_cam = speed[t_cam_idx]
     roll_cam = roll[t_cam_idx]; pitch_cam = pitch[t_cam_idx]
 
     # 相邻帧匹配与 Sampson
@@ -317,17 +330,8 @@ def make_splits(out_dir: Path,
             print(f"[vis-gen][WARN] {tag} median≈{med:.2f} px (too large?)")
 
     def write_vis_meta(out_dir_meta: Path):
-        meta = {
-            "unit": "px",
-            "feature_names": [
-                "num_inlier_norm","flow_mag_mean","flow_mag_std","baseline_m",
-                "yaw_rate","speed_proxy","roll","pitch"
-            ],
-            "quantile_triplets": [],
-            "standardize": {"enable": False, "mean": None, "std": None},
-        }
-        out_dir_meta.mkdir(parents=True, exist_ok=True)
-        (out_dir_meta / "vis_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+        # 保留在 synth_vis 中的 meta（带 mean/std）；这里不再额外写一份
+        pass
 
     def one_split(num_routes, split_name, seed_base):
         dt = 1.0 / rate_hz
@@ -337,30 +341,38 @@ def make_splits(out_dir: Path,
         t_cam_idx = np.arange(0, T_long, cam_step, dtype=np.int32)
         T_cam = len(t_cam_idx)
 
-        # 地图点（共享）
-        Pw = sample_landmarks(num=4000, seed=seed_base+77)
+        # 地图点将在每个route内部根据行驶距离动态生成
 
         Xa_list,Ea_list,Ma_list,YAa_list = [],[],[],[]
         Xg_list,Eg_list,Mg_list,YGg_list = [],[],[],[]
         Xv_list,Ev_list,Mv_list = [],[],[]
         seg_list = []  # (per-route) camera timeline labels
 
+        print(f"[{split_name}] Processing {num_routes} routes...")
         for r in range(num_routes):
+            print(f"  Route {r+1}/{num_routes}...", end=" ", flush=True)
             seed_r = seed_base + r
             # 生成 IMU 长序列
-            X_imu, E2_imu, Yacc, Ygyr, roll, pitch, speed = simulate_imu(T_long, dt, seed_r,
+            X_imu, E2_imu, Yacc, Ygyr, roll, pitch, speed, yaw, xy = simulate_imu(T_long, dt, seed_r,
                                                                           use_slip=use_slip,
                                                                           use_gravity=use_gravity,
                                                                           use_roll_pitch=use_roll_pitch,
                                                                           bank_gain=bank_gain, pitch_gain=pitch_gain)
-            # （简单）车体 xy 与 yaw：从速度/航向推演或记录；这里快速近似：
-            yaw = np.cumsum(X_imu[:,5]) * dt    # 积分 gz 作为 yaw（仅用于视觉状态）
-            xy  = np.cumsum(np.stack([speed*np.cos(yaw), speed*np.sin(yaw)],axis=-1), axis=0) * dt
+            # 现在使用真值 yaw/xy（避免陀螺积分漂移导致相机走出点云走廊）
+
+            # 根据该route的行驶距离动态生成点云
+            dist_est = float(np.sum(speed) * dt)                 # ≈ 平均速度 × 时长
+            x_max   = max(100.0, dist_est * 1.2)                 # 留一点富余
+            density = 40.0                                       # 每米点数（保持可见点充足）
+            num_pts = int(max(4000, density * x_max))
+            Pw = sample_landmarks(num=num_pts, seed=seed_r+77, x_max=x_max)
+            print(f"[{split_name}/route{r}] dist_est={dist_est:.1f}m, x_max={x_max:.1f}m, landmarks={num_pts}")
 
             # 视觉：从轨迹仿真
             K = np.array([[fx,0,cx],[0,fy,cy],[0,0,1]], np.float32)
+            dt_cam = cam_step * (1.0 / rate_hz)
             E2_vis, X_vis, M_vis = simulate_vision_from_trajectory(
-                T_cam, t_cam_idx, yaw, roll, pitch, xy, K, (img_w,img_h), Pw,
+                T_cam, t_cam_idx, yaw, roll, pitch, xy, speed, dt_cam, K, (img_w,img_h), Pw,
                 noise_px=noise_px, outlier_ratio=outlier_ratio, min_match=min_match, seed=seed_r+999
             )
 
@@ -368,8 +380,16 @@ def make_splits(out_dir: Path,
             # 有效覆盖率与单位量级检查（基于光流均值，像素）
             valid = (M_vis > 0.5).reshape(-1)
             cov = float(valid.mean()) if valid.size else 0.0
-            print(f"[{split_name}] vis_coverage={cov:.3f}")
+            print(f"[{split_name}/route{r}] T_cam={T_cam} vis_coverage={cov:.3f}")
             approx_unit_check_flow(X_vis[valid, 1] if valid.any() else np.array([]), tag=f"{split_name}/route{r}/flow_mean")
+            
+            # 详细统计：可见点、公共点、内点数量
+            if valid.any():
+                inlier_norm = X_vis[valid, 0]  # 内点比例
+                flow_mean = X_vis[valid, 1]    # 光流均值
+                baseline = X_vis[valid, 3]     # 基线范数
+                print(f"[{split_name}/route{r}] med_inlier_norm={np.median(inlier_norm):.3f}, "
+                      f"med_flow={np.median(flow_mean):.2f}px, med_baseline={np.median(baseline):.3f}")
             # 段落标注（启发式）：1=纯旋(转动大/基线小)，2=弱视差(流量小&基线小)，3=内点下降(内点比小)
             seg_id = np.zeros((T_cam,), dtype=np.int32)
             baseline = X_vis[:,3]
@@ -412,7 +432,9 @@ def make_splits(out_dir: Path,
             Xv = sliding_window(X_vis,         vis_win, vis_str)
             Ev = sliding_window(E2_vis[:,None],vis_win, vis_str)
             Mv = sliding_window(M_vis[:,None], vis_win, vis_str)[:, :, 0]
+            print(f"[{split_name}/route{r}] VIS windows={Xv.shape[0]} from T_cam={T_cam}, window_coverage={Mv.mean():.3f}")
             Xv_list.append(Xv); Ev_list.append(Ev); Mv_list.append(Mv)
+            print("✓")  # 标记该route完成
 
         # 拼接
         Xa  = np.concatenate(Xa_list,0).astype(np.float32)
@@ -439,6 +461,11 @@ def make_splits(out_dir: Path,
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Train / Val / Test
+    print(f"\n=== Generating Visual+IMU Data ===")
+    print(f"Train: {train_routes} routes | Val: {val_routes} routes | Test: {test_routes} routes")
+    print(f"Trajectory: {traj_duration_s}s @ {rate_hz}Hz | Camera: {cam_rate_hz}Hz")
+    print(f"Visual windows: {vis_win}x{vis_str} | IMU windows: ACC {acc_win}x{acc_str}, GYR {gyr_win}x{gyr_str}\n")
+    
     acc_tr,gyr_tr,vis_tr = one_split(train_routes, "train", seed+1000)
     acc_va,gyr_va,vis_va = one_split(val_routes,   "val",   seed+2000)
     acc_te,gyr_te,vis_te = one_split(test_routes,  "test",  seed+3000)
@@ -451,13 +478,15 @@ def make_splits(out_dir: Path,
         np.savez(out_dir/f"{prefix}_acc.npz", X=Xa, E2=Ea, MASK=Ma, Y_ACC=YAa)
         np.savez(out_dir/f"{prefix}_gyr.npz", X=Xg, E2=Eg, MASK=Mg, Y_GYR=YGg)
         np.savez(out_dir/f"{prefix}_vis.npz", X=Xv, E2=Ev, MASK=Mv)
+        print(f"[{prefix}] Final VIS: {Xv.shape[0]} windows, coverage={Mv.mean():.3f}")
 
-    # 写一次元数据
-    write_vis_meta(out_dir)
+    # 旧行为：写一次 meta 到 out_dir；现取消，避免与 synth_vis/vis_meta.json 冲突
 
+    print("\n=== Saving datasets ===")
     savetag("train", acc_tr, gyr_tr, vis_tr)
     savetag("val",   acc_va, gyr_va, vis_va)
     savetag("test",  acc_te, gyr_te, vis_te)
+    print("=== All datasets saved ===\n")
 
     # ---- 追加：VIS 端元数据与分段标签（最小自检产物） ----
     synth_vis_dir = out_dir / "synth_vis"
@@ -556,9 +585,13 @@ def main():
     ap.add_argument("--vis_stride", type=int, default=vis.get("vis_stride", 32))
     ap.add_argument("--noise_px", type=float, default=vis.get("noise_px", 0.5))
     ap.add_argument("--outlier_ratio", type=float, default=vis.get("outlier_ratio", 0.1))
-    ap.add_argument("--min_match", type=int, default=vis.get("min_match", 20))
+    ap.add_argument("--min_match", type=int, default=vis.get("min_match", 12))
 
     args = ap.parse_args()
+    
+    # 调试：确认配置被正确读取
+    print(f"[cfg] cam_rate_hz={args.cam_rate_hz}  min_match={args.min_match}  outlier_ratio={args.outlier_ratio}  noise_px={args.noise_px}")
+    print(f"[cfg] vis_window={args.vis_window}  vis_stride={args.vis_stride}")
 
     make_splits(
         Path(args.out),
