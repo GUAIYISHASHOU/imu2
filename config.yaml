@@ -27,10 +27,10 @@ bicycle:
 
 # Training configuration (train.py)
 train:
-  route: acc
-  train_npz: data_vis/train_acc.npz
-  val_npz: data_vis/val_acc.npz
-  test_npz: data_vis/test_acc.npz
+  route: vis
+  train_npz: data_vis/train_vis.npz
+  val_npz: data_vis/val_vis.npz
+  test_npz: data_vis/test_vis.npz
   run_dir: runs/vis
   epochs: 300
   batch_size: 32
@@ -58,8 +58,8 @@ runtime:
   device: cuda
 
 eval:
-  route: acc
-  npz: data_vis/test_acc.npz
+  route: vis
+  npz: data_vis/test_vis.npz
   model: runs/vis/best.pt
   x_mode: both
 
@@ -79,8 +79,16 @@ vis:
   fy: 400.0
   cx: 320.0
   cy: 240.0
-  vis_window: 64
-  vis_stride: 32
+  vis_window: 32   # 降到32，响应更快
+  vis_stride: 16
   noise_px: 0.35
+  noise_tau_s: 0.4
+  noise_ln_std: 0.35
   outlier_ratio: 0.05
+  out_tau_s: 0.6
+  burst_prob: 0.03
+  burst_gain: [0.2, 0.6]
+  motion_k1: 0.8
+  motion_k2: 0.4
+  lp_pool_p: 3.0
   min_match: 8

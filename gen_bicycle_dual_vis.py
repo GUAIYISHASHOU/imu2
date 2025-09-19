@@ -174,7 +174,11 @@ def sampson_dist(x1n, x2n, E):
 
 def simulate_vision_from_trajectory(T_cam, t_cam_idx, yaw, roll, pitch, xy, speed, dt_cam,   # 轨迹（下采样到相机时刻的索引）
                                     K, img_wh, Pw, noise_px=0.5, outlier_ratio=0.1,
-                                    min_match=20, seed=0):
+                                    min_match=20, seed=0, 
+                                    # 新增时变参数
+                                    noise_tau_s=0.4, noise_ln_std=0.30, out_tau_s=0.6,
+                                    burst_prob=0.03, burst_gain=(0.2, 0.6),
+                                    motion_k1=0.8, motion_k2=0.4, lp_pool_p=3.0):
     """
     基于轨迹位姿 + 3D 地图，仿真相机观测与相邻帧匹配，并计算每帧 E2_vis。
     返回：
@@ -183,6 +187,53 @@ def simulate_vision_from_trajectory(T_cam, t_cam_idx, yaw, roll, pitch, xy, spee
       MASK:   (T_cam,)  有效帧掩码（首帧或匹配不足置 0）
     """
     rng = np.random.default_rng(seed)
+    
+    # ================ Lp pooling聚合函数 ================
+    def aggregate_r2(r2, p=3.0):
+        r2 = np.asarray(r2, np.float64)
+        if r2.size == 0:
+            return 0.0
+        return float((np.mean(np.power(r2, p/2.0)))**(2.0/p))
+    
+    # ================ 时变噪声和外点率生成 ================
+    dtc = dt_cam
+    
+    # ① 基于 log-正态抖动的像素噪声幅度（更贴近"画质/模糊"）
+    alpha_n = np.exp(-dtc / max(1e-3, noise_tau_s))
+    z = 0.0
+    noise_px_t = np.empty(T_cam, dtype=np.float32)
+    for k in range(T_cam):
+        z = alpha_n*z + np.sqrt(1 - alpha_n**2) * rng.normal(0, noise_ln_std)
+        noise_px_t[k] = noise_px * np.exp(z)   # 基于原 noise_px 做比例抖动
+
+    # ② 外点率 OU + 突发项
+    alpha_o = np.exp(-dtc / max(1e-3, out_tau_s))
+    y = 0.0
+    outlier_t = np.empty(T_cam, dtype=np.float32)
+    for k in range(T_cam):
+        y = alpha_o*y + np.sqrt(1 - alpha_o**2) * rng.normal(0, 0.05)
+        outlier_t[k] = np.clip(outlier_ratio + y, 0.0, 0.6)
+        # 随机突发（比如强遮挡/快速横摆导致错误匹配暴增）
+        if rng.random() < burst_prob:
+            outlier_t[k] = np.clip(outlier_t[k] + rng.uniform(*burst_gain), 0.0, 0.8)
+
+    # ③ 运动相关的观测质量调节
+    yaw_rate_cam = np.diff(yaw, prepend=yaw[:1]) / max(1e-6, dtc)
+    speed_cam = speed
+    yaw_ref = 0.6    # 可按数据范围调
+    v_ref   = 6.0
+
+    for k in range(T_cam):
+        scale = 1.0 + motion_k1 * min(1.0, abs(yaw_rate_cam[k]) / yaw_ref) \
+                     + motion_k2 * min(1.0, abs(speed_cam[k])        / v_ref)
+        noise_px_t[k] *= scale
+        outlier_t[k]   = np.clip(outlier_t[k] * scale, 0.0, 0.85)
+
+    # ④ 帧内"可用内点数"波动（更真实的纹理/视差变化）
+    N0 = 200  # 基础内点数
+    N_scale = np.clip(np.exp(0.4 * rng.normal(size=T_cam)), 0.5, 1.5)  # lognormal
+    N_inlier_target = np.maximum(min_match, (N0 * N_scale * (1.0 - outlier_t)).astype(int))
+    
     # 相机外参：车体x(前进)→相机z(光轴), 车体y(左)→相机-x(右), 车体z(上)→相机-y(下)
     R_cb = np.array([[ 0, -1,  0],
                      [ 0,  0, -1],
@@ -199,7 +250,7 @@ def simulate_vision_from_trajectory(T_cam, t_cam_idx, yaw, roll, pitch, xy, spee
     idlists = []
     Pc_list = []
     for k in range(T_cam):
-        uv, id_in_img, Pc = project_points(Pw, Rcw_all[k], tcw_all[k], K, img_wh, noise_px=noise_px, rng=rng)
+        uv, id_in_img, Pc = project_points(Pw, Rcw_all[k], tcw_all[k], K, img_wh, noise_px=noise_px_t[k], rng=rng)
         UV.append(uv)
         idlists.append(id_in_img)  # 这些是 Pw 的索引子集
         Pc_list.append(Pc)
@@ -228,8 +279,8 @@ def simulate_vision_from_trajectory(T_cam, t_cam_idx, yaw, roll, pitch, xy, spee
         if common.size < min_match:
             MASK[k] = 0.0
             continue
+            
         # 从两帧里取出这些点的像素观测
-        # 需要把局部列表下标映射回交集的相对位置
         def pick_uv(UV_list, idlist, common_ids):
             pos = {gid:i for i,gid in enumerate(idlist)}
             idx = [pos[g] for g in common_ids]
@@ -237,9 +288,18 @@ def simulate_vision_from_trajectory(T_cam, t_cam_idx, yaw, roll, pitch, xy, spee
         uv1 = pick_uv(UV[k-1], ids_prev, common)
         uv2 = pick_uv(UV[k],   ids_curr, common)
 
-        # 注入外点
+        # 按目标内点数截断（模拟纹理/视差变化）
+        M_available = uv1.shape[0]
+        M_target = min(M_available, N_inlier_target[k])
+        if M_target < M_available:
+            # 随机子采样到目标数量
+            keep_idx = rng.choice(M_available, size=M_target, replace=False)
+            uv1 = uv1[keep_idx]
+            uv2 = uv2[keep_idx]
+
+        # 注入外点（使用时变外点率）
         M = uv1.shape[0]
-        m_out = int(M * outlier_ratio)
+        m_out = int(M * outlier_t[k])
         if m_out > 0:
             rnd = rng.choice(M, size=m_out, replace=False)
             uv2[rnd] += rng.normal(scale=20.0, size=(m_out,2)).astype(np.float32)
@@ -258,7 +318,10 @@ def simulate_vision_from_trajectory(T_cam, t_cam_idx, yaw, roll, pitch, xy, spee
         d2 = sampson_dist(x1n, x2n, E)  # (M,)
         # 统计 & 特征
         flow = np.linalg.norm(uv2 - uv1, axis=1)
-        E2_vis[k] = float(np.sum(d2))
+        # 使用 Lp pooling 聚合 + 标准化
+        C = 500.0  # 标准化常数
+        N_inlier_actual = max(1, M - m_out)  # 实际内点数
+        E2_vis[k] = aggregate_r2(d2, p=lp_pool_p) * (C / N_inlier_actual)
         num_inl = float(M)
         X_vis[k] = np.array([
             num_inl / 500.0,                 # 归一化匹配数（500 可按数据量调整）
@@ -297,7 +360,10 @@ def make_splits(out_dir: Path,
                 gyr_win:int, gyr_str:int, gyr_preproc:str, gyr_ma:int,
                 # 视觉配置
                 cam_rate_hz: float, img_w:int, img_h:int, fx:float, fy:float, cx:float, cy:float,
-                vis_win:int, vis_str:int, noise_px:float, outlier_ratio:float, min_match:int):
+                vis_win:int, vis_str:int, noise_px:float, outlier_ratio:float, min_match:int,
+                # 新增时变参数
+                noise_tau_s:float, noise_ln_std:float, out_tau_s:float,
+                burst_prob:float, burst_gain:tuple, motion_k1:float, motion_k2:float, lp_pool_p:float):
 
     def preprocess(x_long, mode, ma_len):
         if mode == "raw": return x_long
@@ -373,7 +439,9 @@ def make_splits(out_dir: Path,
             dt_cam = cam_step * (1.0 / rate_hz)
             E2_vis, X_vis, M_vis = simulate_vision_from_trajectory(
                 T_cam, t_cam_idx, yaw, roll, pitch, xy, speed, dt_cam, K, (img_w,img_h), Pw,
-                noise_px=noise_px, outlier_ratio=outlier_ratio, min_match=min_match, seed=seed_r+999
+                noise_px=noise_px, outlier_ratio=outlier_ratio, min_match=min_match, seed=seed_r+999,
+                noise_tau_s=noise_tau_s, noise_ln_std=noise_ln_std, out_tau_s=out_tau_s,
+                burst_prob=burst_prob, burst_gain=burst_gain, motion_k1=motion_k1, motion_k2=motion_k2, lp_pool_p=lp_pool_p
             )
 
             # ---- 轻量自检与段标 ----
@@ -586,8 +654,24 @@ def main():
     ap.add_argument("--noise_px", type=float, default=vis.get("noise_px", 0.5))
     ap.add_argument("--outlier_ratio", type=float, default=vis.get("outlier_ratio", 0.1))
     ap.add_argument("--min_match", type=int, default=vis.get("min_match", 12))
+    # 新增时变参数
+    ap.add_argument("--noise_tau_s", type=float, default=vis.get("noise_tau_s", 0.4))
+    ap.add_argument("--noise_ln_std", type=float, default=vis.get("noise_ln_std", 0.30))
+    ap.add_argument("--out_tau_s", type=float, default=vis.get("out_tau_s", 0.6))
+    ap.add_argument("--burst_prob", type=float, default=vis.get("burst_prob", 0.03))
+    ap.add_argument("--burst_gain", type=str, default=str(vis.get("burst_gain", [0.2, 0.6])))
+    ap.add_argument("--motion_k1", type=float, default=vis.get("motion_k1", 0.8))
+    ap.add_argument("--motion_k2", type=float, default=vis.get("motion_k2", 0.4))
+    ap.add_argument("--lp_pool_p", type=float, default=vis.get("lp_pool_p", 3.0))
 
     args = ap.parse_args()
+    
+    # 解析 burst_gain 参数
+    import ast
+    try:
+        args.burst_gain = ast.literal_eval(args.burst_gain) if isinstance(args.burst_gain, str) else args.burst_gain
+    except:
+        args.burst_gain = [0.2, 0.6]  # 默认值
     
     # 调试：确认配置被正确读取
     print(f"[cfg] cam_rate_hz={args.cam_rate_hz}  min_match={args.min_match}  outlier_ratio={args.outlier_ratio}  noise_px={args.noise_px}")
@@ -602,7 +686,9 @@ def main():
         args.acc_window, args.acc_stride, args.acc_preproc, args.acc_ma,
         args.gyr_window, args.gyr_stride, args.gyr_preproc, args.gyr_ma,
         args.cam_rate_hz, args.img_w, args.img_h, args.fx, args.fy, args.cx, args.cy,
-        args.vis_window, args.vis_stride, args.noise_px, args.outlier_ratio, args.min_match
+        args.vis_window, args.vis_stride, args.noise_px, args.outlier_ratio, args.min_match,
+        args.noise_tau_s, args.noise_ln_std, args.out_tau_s,
+        args.burst_prob, args.burst_gain, args.motion_k1, args.motion_k2, args.lp_pool_p
     )
     print("Done.")
 
