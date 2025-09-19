@@ -29,8 +29,18 @@ def _route_metrics(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
     msum = torch.clamp(m.sum(), min=1.0)
     z2_mean = float((z2 * m).sum() / msum)
     rad = torch.sqrt(z2)
-    cov68 = float((((rad <= 1.0).float() * m).sum()) / msum)
-    cov95 = float((((rad <= 2.0).float() * m).sum()) / msum)
+    
+    # 使用正确的卡方分位数阈值
+    from math import sqrt
+    if abs(df - 2.0) < 1e-6:
+        r68, r95 = 1.509596, 2.447746  # χ²₂(0.68), χ²₂(0.95)
+    elif abs(df - 3.0) < 1e-6:
+        r68, r95 = 1.872401, 2.795483  # χ²₃(0.68), χ²₃(0.95)
+    else:
+        r68, r95 = 1.0, 2.0  # fallback for other df values
+    
+    cov68 = float((((rad <= r68).float() * m).sum()) / msum)
+    cov95 = float((((rad <= r95).float() * m).sum()) / msum)
 
     es = (e2sum * m).detach().cpu().numpy().reshape(-1)
     vv = (var * m).detach().cpu().numpy().reshape(-1)

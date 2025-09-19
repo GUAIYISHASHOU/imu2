@@ -38,8 +38,9 @@ train:
   x_mode: both
   # target_mode: pooled2  # ❌ 删除（train.py 未使用）
   logv_min: -12
-  logv_max: 6
+  logv_max: 4
   seed: 0
+  z2_center: 1e-3  # VIS路由z²居中正则化权重
   # 需要的话可加：
   # early_patience: 10
   # anchor_weight: 0.0

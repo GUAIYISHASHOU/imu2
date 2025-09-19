@@ -41,6 +41,7 @@ def parse_args():
     ap.add_argument("--num_workers", type=int, default=rt.get("num_workers",0))
     ap.add_argument("--logv_min", type=float, default=tr.get("logv_min",-12.0))
     ap.add_argument("--logv_max", type=float, default=tr.get("logv_max",6.0))
+    ap.add_argument("--z2_center", type=float, default=tr.get("z2_center",0.0), help="VIS路由z²居中正则化权重")
     ap.add_argument("--anchor_weight", type=float, default=tr.get("anchor_weight",0.0))
     ap.add_argument("--early_patience", type=int, default=tr.get("early_patience", 10))
     ap.add_argument("--device", default=rt.get("device","cuda" if torch.cuda.is_available() else "cpu"))
@@ -86,6 +87,13 @@ def main():
             if args.route == "vis":
                 loss = nll_iso2_e2(batch["E2"], logv, m,
                                    logv_min=args.logv_min, logv_max=args.logv_max)
+                # z²居中正则化：推动z²均值接近1
+                if args.z2_center > 0:
+                    v = torch.exp(logv).clamp_min(1e-12)
+                    z2 = (batch["E2"].squeeze(-1) / v.squeeze(-1)) / 2.0
+                    m_float = m.float()
+                    mean_z2 = (z2 * m_float).sum() / m_float.clamp_min(1.0).sum()
+                    loss = loss + args.z2_center * (mean_z2 - 1.0).pow(2)
             else:
                 loss = nll_iso3_e2(batch["E2"], logv, m,
                                    logv_min=args.logv_min, logv_max=args.logv_max)
