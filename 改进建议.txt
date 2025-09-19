@@ -1,84 +1,231 @@
-你的 vis_coverage≈0.054 ≈ cam_rate_hz / rate_hz * 某个通过率（10/100≈0.10，再乘上“配对+内点”的通过率 ≈0.5），说明掩码只在相机采样点上为 1，但滑窗是在 100 Hz 的 IMU 时间轴上取的，导致一段 64（IMU tick）长度的窗里只有极少数相机帧是有效的。
+1) dataset.py：新增 GNSS 数据集 & 工厂注册
 
-一句话结论
+目标：读入 data_gns/{train,val,test}_gns.npz（字段含 X, Y, mask），并在 build_dataset 支持 route='gns'。
 
-把 VIS 的滑窗改到“相机时间轴” 上（而不是 IMU 100 Hz 轴），覆盖率会立刻回到 0.6–0.9；或者临时把“有效窗过滤阈值”开起来先训也行。
+把下面两段加进 dataset.py（第一段是一个新类，第二段是工厂里的新增分支）。如果你的文件里已有类似工厂函数，按注释把 “gns” case 粘进去即可。
 
-立刻修：让 VIS 在“相机时间轴”滑窗（最稳妥）
+# === 1) 新增：GNSS 数据集（ENU三维） =========================
+import numpy as np
+from torch.utils.data import Dataset
 
-目标：X/E2/MASK 先按相机帧序列构建（长度 = 相机帧数），再用 vis_window/vis_stride 在相机索引上切窗。
+class GNSDataset(Dataset):
+    def __init__(self, npz_path: str):
+        z = np.load(npz_path, allow_pickle=True)
+        self.X   = z['X'].astype(np.float32)     # (N, T, Din)
+        self.Y   = z['Y'].astype(np.float32)     # (N, T, 3)  ENU误差
+        self.mask= z['mask'].astype(bool)        # (N, T, 3)
+        self.meta= z.get('meta', None)
+        assert self.X.shape[0] == self.Y.shape[0] == self.mask.shape[0]
+        assert self.Y.shape[-1] == 3, "GNS Y should be (..,3) for ENU"
+    def __len__(self):  return self.X.shape[0]
+    def __getitem__(self, i):
+        return self.X[i], self.Y[i], self.mask[i]
 
-在 gen_bicycle_dual_vis.py 里（大致的位置：你生成出按帧的 X_vis_seq, E2_vis_seq, M_vis_seq 之后），把“切窗”那段替换为（示意伪码，变量名照你的代码对上）：
+# === 2) 在数据集工厂中注册 route='gns' =======================
+def build_dataset(route: str, split_npz: str):
+    route = route.lower()
+    if route in ('acc','gyr','vis'):
+        # 你现有的分支保持不动
+        ...
+    elif route == 'gns':
+        return GNSDataset(split_npz)
+    else:
+        raise ValueError(f"Unknown route {route}")
 
-# 假设这里的三个序列都是按“相机帧”的时间轴排好的
-# 形状：X_seq = (N_cam, D), E2_seq = (N_cam, 1), M_seq = (N_cam,)
-N_cam = X_seq.shape[0]
-W, S = vis_window, vis_stride  # 这两个参数继续从 config 里读
+2) train.py：让模型&损失自适应 D=3，并支持 route='gns'
 
-X_wins, E2_wins, M_wins = [], [], []
-for s in range(0, max(0, N_cam - W + 1), S):
-    e = s + W
-    X_wins.append(X_seq[s:e])
-    E2_wins.append(E2_seq[s:e])
-    M_wins.append(M_seq[s:e])
+目标：不改你原有的 acc/gyr/vis 流程，只是让 --route gns 走同一套训练，自动从批数据读出 Din/D。
 
-X_wins = np.stack(X_wins, 0).astype(np.float32)       # (N_win, W, D)
-E2_wins = np.stack(E2_wins, 0).astype(np.float32)     # (N_win, W, 1)
-M_wins  = np.stack(M_wins, 0).astype(np.float32)      # (N_win, W)
-print(f"[{split}] VIS windows={len(X_wins)}  cam_frames={N_cam}  coverage={M_wins.mean():.3f}")
-np.savez(out_dir/f"{split}_vis.npz", X=X_wins, E2=E2_wins, MASK=M_wins)
+在 train.py 中做三处最小改动：
 
+(A) argparse 的 route choices 加上 gns
+ap.add_argument('--route', type=str, default='vis',
+                choices=['acc','gyr','vis','gns'])
 
-这样做后，coverage≈有效相机帧占比，不会再被 100 Hz 的 IMU 轴稀释成 0.05。
+(B) 动态确定输入/输出维度，构建模型
 
-如果你现在的实现是先把 MASK 挂到 100 Hz 轴上，再切 100 Hz 的窗，那在 cam_rate_hz=10、vis_window=64 时，理论上 coverage 只能 ≈0.1；再叠加“需要相邻两帧都是相机帧”与“min_match/内点率”门控，很容易掉到 ~0.05——这正是你现在看到的数字。
+在你创建模型的地方（通常拿到 train_loader 之后），补上：
 
-备选（不改生成流程也能训）：过滤“有效帧太少”的窗
+# 取一个batch来确定 Din / D
+xb, yb, mb = next(iter(train_loader))
+Din = xb.shape[-1]     # 输入维度
+D   = yb.shape[-1]     # 输出维度（VIS=2, GNS=3, IMU=3）
 
-如果你当前不方便改生成器，直接在 dataset.py 的 VIS 分支加“最小可用比例”过滤，也能把训练稳住：
-
-# 载入完 X_all, E2_all, M_all 之后（route=='vis'）
-ratio = self.M_all.mean(axis=1)                 # 每个窗的有效帧占比
-keep  = ratio >= getattr(self, "min_vis_ratio", 0.3)
-self.X_all = self.X_all[keep]
-self.E2_all = self.E2_all[keep]
-self.M_all  = self.M_all[keep]
-print(f"[dataset][vis] keep {keep.sum()}/{len(keep)} windows (min_ratio={getattr(self,'min_vis_ratio',0.3)})")
-
-
-训练时带上：
-
-python train.py --route vis ... --min_vis_ratio 0.3
-
-
-这不会提升“覆盖率”本身，但会丢掉没什么监督信号的窗，收敛和指标会明显稳定。
-
-小排查：确认你的配置真被读到了
-
-在 gen_bicycle_dual_vis.py 读 config.yaml 后，打印以下四个值，防止你改了 YAML 但脚本没用上：
-
-print(f"[cfg] cam_rate_hz={cam_rate_hz}  min_match={min_match}  outlier_ratio={outlier_ratio}  noise_px={noise_px}")
-
-
-如果你已经把 min_match 改到 8、outlier_ratio 改到 0.05，但日志里还是旧值，那就是配置没生效（路径/段名或解析问题）。
-
-不要再把 cam_rate 降低了（在没切到相机轴之前）
-
-之前我建议把 cam_rate_hz: 10 -> 5 是**建立在“VIS 在相机时间轴切窗”**的前提下。当前你的代码还在 IMU 轴切窗的话，降帧率只会进一步降低 coverage。
-所以顺序是：先改为相机轴切窗 → 再考虑把 cam_rate_hz 调到 5 以提高帧间基线和匹配质量。
-
-最后，给一个“定位到底卡在哪”的打印
-
-把这段塞到你计算掩码逻辑的旁边（每帧/每窗统计一次）：
-
-# 仅示意：统计三种数量的中位数（可见点 / 帧间公共ID / RANSAC内点）
-print(f"[{split}/route{r}] med n_vis={np.median(n_visible):.0f}, "
-      f"med n_common={np.median(n_common):.0f}, med n_inlier={np.median(n_inlier):.0f}, "
-      f"coverage={float((M_seq>0.5).mean()):.3f}")
+# 如果你的 models.py 里 Model 类接收 d_in / d_out，请按你工程实际命名传入
+model = Model(d_in=Din, d_model=cfg['model'].get('d_model',128),
+              d_out=D,
+              n_tcn=cfg['model'].get('n_tcn',4),
+              kernel_size=cfg['model'].get('kernel_size',3),
+              n_layers_tf=cfg['model'].get('n_layers_tf',2),
+              n_heads=cfg['model'].get('n_heads',4),
+              dropout=cfg['model'].get('dropout',0.1)).to(device)
 
 
-med n_common 近 0 → 还是 ID 没对齐（但你说已修）；
+注：如果你当前 Model 构造函数里没有 d_in/d_out 参数，而是写死的，请在 models.py 增加这两个参数，并把最后线性头 nn.Linear(d_model, d_out) 按 D 建。其它不需要动。
 
-med n_common 正常、med n_inlier 很低 → RANSAC/阈值太严；
+(C) 损失与约束，沿用现有逻辑
 
-两者都正常、coverage 仍 ≈ cam_rate/rate_hz * 0.5 → 确实是 IMU 轴切窗的稀释效应。
+你已有的 NLL 和 z2_center 约束通常是逐维独立地做的（对最后一维 D 循环或向量化）。不需要为 GNS 特别改；只要确保：
+
+logv_min/logv_max 读自配置；
+
+z2_center_target 对 高斯=1.0，默认即可；
+
+不要对 mask 做 squeeze（确保 mask 的最后一维是 D）。
+
+3) eval.py：打印整体指标 + 逐维 ENU 覆盖率，并输出 JSON
+
+目标：当 --route gns 时，既打印原有整体指标（z2_mean, cov68, cov95, spear, sat…），也逐维给出 E[z²] 与覆盖率表，并把两者一起以 JSON 打印/保存。
+
+把下面这段加入 eval.py 的评测输出逻辑里（保持你原有指标统计函数不变，只是多一段“逐维切片”）：
+
+import json, numpy as np
+# 假设 err2, var_pred, mask 已算好，形状 (N,T,D)
+
+def coverage(err2, var, q=0.95):
+    # 误差^2 <= q分位的理论阈值？若用高斯→阈=chi2(D=1)或逐维各自；你现有实现怎么做就用它
+    # 这里按逐维：err2/var <= thresh(=3.841 for 95%) 的比例
+    from scipy.stats import chi2
+    thr = chi2.ppf(q, df=1)
+    return np.mean((err2/np.maximum(var,1e-12)) <= thr)
+
+D = err2.shape[-1]
+results = {
+  "z2_mean": float(np.mean(err2/np.maximum(var_pred,1e-12))),
+  "cov68": float(coverage(err2, var_pred, 0.68)),
+  "cov95": float(coverage(err2, var_pred, 0.95)),
+  "spear": float(spearmanr(err2.reshape(-1), var_pred.reshape(-1)).correlation),
+  "sat": float(np.mean(np.isclose(np.log(var_pred), LOGV_MIN, atol=1e-6))),
+  "sat_min": float(np.mean(np.log(var_pred) <= LOGV_MIN + 1e-6)),
+  "sat_max": float(np.mean(np.log(var_pred) >= LOGV_MAX - 1e-6)),
+}
+
+# —— 逐维 ENU —— #
+per_axis = []
+axis_names = ['E','N','U'] if D==3 else (['x','y'] if D==2 else [f'd{i}' for i in range(D)])
+for d in range(D):
+    m = mask[..., d]
+    e2 = err2[..., d][m]
+    vp = var_pred[..., d][m]
+    z2 = e2/np.maximum(vp,1e-12)
+    per_axis.append({
+        "axis": axis_names[d],
+        "Ez2": float(np.mean(z2)),
+        "cov68": float(np.mean(z2 <= 1.0)), # 高斯1维: 68% ≈ z^2<=1
+        "cov95": float(np.mean(z2 <= 3.841)), # 95% 阈值
+        "count": int(e2.size)
+    })
+results["per_axis"] = per_axis
+
+print(json.dumps(results, indent=2, ensure_ascii=False))
+# 可选：保存到 runs/<route>/eval_<split>.json
+
+
+你已经在 VIS 路由上输出过整体指标；这段只是把“逐维 ENU”补上并融合输出为一个 JSON。
+
+4) analyze.py：新增 GNSS 的图——直方图、散点（log-log）、时序 + 逐维表
+
+目标：当 --route gns 时，自动出 4 张图（与 VIS 同款，但 D=3）：
+
+z² 直方图；2) err²–var 的散点（log–log）；3) logvar 三条线（E/N/U）；4) 逐维表导出 CSV/JSON。
+
+在你现有 analyze.py 的图代码块里，加一个 if route=='gns': 的分支（D=3）。下面是可直接贴用的核心片段（变量名按你现有的对齐即可）：
+
+import numpy as np, matplotlib.pyplot as plt, json, os
+
+# 假设 err2, var_pred, mask 已算好，形状 (N,T,D)
+D = err2.shape[-1]
+assert D in (2,3)
+names = ['E','N','U'] if D==3 else ['x','y']
+
+# 1) z^2 直方图
+z2 = (err2 / np.maximum(var_pred,1e-12))[mask]
+plt.figure(); plt.hist(z2, bins=60, density=True)
+plt.title(f'Route={args.route}  z^2 histogram'); plt.xlabel('z^2'); plt.ylabel('pdf')
+plt.tight_layout(); plt.savefig(os.path.join(args.out, 'hist_z2.png')); plt.close()
+
+# 2) err^2 vs var（per-window，log-log）
+e2v = err2[mask]; vpv = var_pred[mask]
+plt.figure(); plt.scatter(e2v, vpv, s=4, alpha=0.3)
+plt.xscale('log'); plt.yscale('log')
+plt.xlabel('err^2'); plt.ylabel('pred var'); plt.title('Scatter (per-observation, log-log)')
+plt.tight_layout(); plt.savefig(os.path.join(args.out, 'scatter_err2_vs_var_loglog.png')); plt.close()
+
+# 3) logvar 时序（逐维）
+logv = np.log(np.maximum(var_pred, 1e-30))
+t = np.arange(logv.shape[1]) # 只是索引；如有真实时间戳可替换
+plt.figure()
+for d in range(D):
+    m = mask[..., d]
+    # 取可视化一条序列（第0条），也可做均值
+    plt.plot(logv[0,:,d], label=f'logvar_{names[d]}')
+plt.legend(); plt.title('log variance (per-axis)'); plt.tight_layout()
+plt.savefig(os.path.join(args.out,'timeseries_logvar.png')); plt.close()
+
+# 4) 逐维表（JSON）
+per_axis = []
+for d, nm in enumerate(names):
+    m = mask[..., d]; z2d = (err2[..., d]/np.maximum(var_pred[..., d],1e-12))[m]
+    per_axis.append({
+        "axis": nm,
+        "Ez2": float(np.mean(z2d)),
+        "cov68": float(np.mean(z2d<=1.0)),
+        "cov95": float(np.mean(z2d<=3.841)),
+        "count": int(np.sum(m))
+    })
+with open(os.path.join(args.out, 'per_axis.json'),'w',encoding='utf-8') as f:
+    json.dump(per_axis, f, ensure_ascii=False, indent=2)
+
+5) models.py（仅当需要）：让模型不写死输出维度
+
+若你当前 Model 把输出维度写死成 2（VIS）或 3（IMU），请把最后一层线性头改成按构造参数 d_out 设置，并在 forward 里返回形状 (B,T,D) 的 mu、logvar 或你现在的输出结构。例如：
+
+class Model(nn.Module):
+    def __init__(self, d_in, d_model, d_out, n_tcn=4, kernel_size=3, n_layers_tf=1, n_heads=2, dropout=0.1):
+        super().__init__()
+        self.enc = YourTCNFront(d_in, d_model, n_tcn, kernel_size, dropout)
+        self.attn = YourTinyTransformer(d_model, n_layers_tf, n_heads, dropout) if n_layers_tf>0 else nn.Identity()
+        self.head = nn.Linear(d_model, 2*d_out)   # 输出 (mu, logvar) 各 D 维
+    def forward(self, x):
+        h = self.attn(self.enc(x))
+        out = self.head(h)           # (B,T,2D)
+        D = out.shape[-1]//2
+        mu, logv = out[..., :D], out[..., D:]
+        return mu, logv
+
+
+如果你当前是“仅预测方差”的架构，也可以只输出 logv，不影响本文其它改动。
+
+6) config.yaml：新增 gns 的训练/评测块（不影响老的 vis）
+
+直接把下面块追加到你的 config.yaml（你原来的 bicycle:、vis:、train:、model: 都保留，VIS 照常用）。后续训练 GNSS 时传 --route gns 即可读取这套默认值。
+
+train_gns:
+  route: gns
+  train_npz: data_gns/train_gns.npz
+  val_npz:   data_gns/val_gns.npz
+  test_npz:  data_gns/test_gns.npz
+  run_dir:   runs/gns_tcn
+  epochs: 200
+  batch_size: 32
+  lr: 0.001
+  x_mode: both
+  seed: 0
+  logv_min: -12
+  logv_max: 5
+  z2_center: 1e-3
+  z2_center_target: 1.0
+
+model_gns:
+  d_model: 128
+  n_tcn: 10
+  kernel_size: 3
+  n_heads: 2
+  n_layers_tf: 1
+  dropout: 0.1
+
+eval_gns:
+  route: gns
+  npz: data_gns/test_gns.npz
+  model: runs/gns_tcn/best.pt
+  x_mode: both

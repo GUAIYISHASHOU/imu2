@@ -10,7 +10,7 @@ from models import IMURouteModel
 
 def parse_args():
     ap = argparse.ArgumentParser("Save diagnostics plots for a single-route model")
-    ap.add_argument("--route", choices=["acc","gyr","vis"], required=True)
+    ap.add_argument("--route", choices=["acc","gyr","vis","gns"], required=True)
     ap.add_argument("--npz", required=True)
     ap.add_argument("--model", required=True)
     ap.add_argument("--x_mode", choices=["both","route_only"], default="both")
@@ -24,13 +24,22 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     ds, dl = build_loader(args.npz, route=args.route, x_mode=args.x_mode, batch_size=64, shuffle=False, num_workers=0)
 
-    if args.route == "vis":
+    # 动态确定输入/输出维度
+    if args.route == "gns":
+        sample_batch = next(iter(dl))
+        d_in = sample_batch["X"].shape[-1]
+        d_out = sample_batch["E2"].shape[-1]
+    elif args.route == "vis":
         d_in = ds.X_all.shape[-1]
+        d_out = 1
     else:
         d_in = ds.X_all.shape[-1] if args.x_mode=="both" else 3
+        d_out = 1
+    
     ckpt = torch.load(args.model, map_location="cpu")
     md_args = ckpt.get("args", {})
     model = IMURouteModel(d_in=d_in,
+                          d_out=d_out,
                           d_model=md_args.get("d_model",128),
                           n_tcn=md_args.get("n_tcn",4),
                           kernel_size=md_args.get("kernel_size",3),
@@ -54,7 +63,12 @@ def main():
         if mask.dim() == 3 and mask.size(-1) == 1:
             mask = mask.squeeze(-1)
         mask = mask.float()
-        df = 2.0 if args.route == "vis" else 3.0
+        if args.route == "vis":
+            df = 2.0
+        elif args.route == "gns":
+            df = 3.0  # ENU三维
+        else:
+            df = 3.0  # IMU三维
         z2 = (e2sum / var) / df
         mask_flat = mask > 0.5
 
@@ -115,18 +129,62 @@ def main():
             plt.close()
 
         # Plot 3: time series of logvar (first few sequences)
-        lv = logv.detach().cpu().numpy()
-        T = lv.shape[1]
-        K = min(4, lv.shape[0])
-        plt.figure()
-        for i in range(K):
-            plt.plot(lv[i], label=f"seq{i}")
-        plt.title(f"log variance (first {K} seqs) - route={args.route}")
-        plt.xlabel("t")
-        plt.ylabel("log(var)")
-        plt.tight_layout()
-        plt.savefig(os.path.join(args.out, "timeseries_logvar.png"))
-        plt.close()
+        if args.route == "gns":
+            # GNSS: 逐维时序图
+            lv = logv.detach().cpu().numpy()
+            D = lv.shape[-1]
+            names = ['E','N','U'] if D==3 else (['x','y'] if D==2 else [f'd{i}' for i in range(D)])
+            plt.figure()
+            for d in range(D):
+                plt.plot(lv[0,:,d], label=f'logvar_{names[d]}')  # 只显示第一个序列
+            plt.legend()
+            plt.title('log variance (per-axis)')
+            plt.xlabel("t")
+            plt.ylabel("log(var)")
+            plt.tight_layout()
+            plt.savefig(os.path.join(args.out, "timeseries_logvar.png"))
+            plt.close()
+            
+            # 逐维表（JSON）
+            import json
+            import numpy as np
+            e2_np = e2sum.detach().cpu().numpy()
+            var_np = var.detach().cpu().numpy()
+            mask_np = mask.detach().cpu().numpy()
+            
+            per_axis = []
+            for d, nm in enumerate(names):
+                if D > 1:
+                    m = mask_np[..., d] > 0.5
+                    z2d = (e2_np[..., d]/np.maximum(var_np[..., d], 1e-12))[m]
+                else:
+                    m = mask_np > 0.5
+                    z2d = (e2_np/np.maximum(var_np, 1e-12))[m]
+                
+                per_axis.append({
+                    "axis": nm,
+                    "Ez2": float(np.mean(z2d)),
+                    "cov68": float(np.mean(z2d<=1.0)),
+                    "cov95": float(np.mean(z2d<=3.841)),
+                    "count": int(np.sum(m))
+                })
+            
+            with open(os.path.join(args.out, 'per_axis.json'),'w',encoding='utf-8') as f:
+                json.dump(per_axis, f, ensure_ascii=False, indent=2)
+        else:
+            # 原始时序图
+            lv = logv.detach().cpu().numpy()
+            T = lv.shape[1]
+            K = min(4, lv.shape[0])
+            plt.figure()
+            for i in range(K):
+                plt.plot(lv[i], label=f"seq{i}")
+            plt.title(f"log variance (first {K} seqs) - route={args.route}")
+            plt.xlabel("t")
+            plt.ylabel("log(var)")
+            plt.tight_layout()
+            plt.savefig(os.path.join(args.out, "timeseries_logvar.png"))
+            plt.close()
 
 if __name__ == "__main__":
     main()

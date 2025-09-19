@@ -103,8 +103,43 @@ class IMURouteDataset(Dataset):
             out["Y"] = torch.zeros_like(out["MASK"])
         return out
 
+# === GNSS 数据集（ENU三维） ===
+class GNSDataset(Dataset):
+    def __init__(self, npz_path: str):
+        z = np.load(npz_path, allow_pickle=True)
+        self.X = z['X'].astype(np.float32)     # (N, T, Din)
+        self.Y = z['Y'].astype(np.float32)     # (N, T, 3)  ENU误差
+        self.mask = z['mask'].astype(bool)     # (N, T, 3)
+        self.meta = z.get('meta', None)
+        assert self.X.shape[0] == self.Y.shape[0] == self.mask.shape[0]
+        assert self.Y.shape[-1] == 3, "GNS Y should be (..,3) for ENU"
+    
+    def __len__(self):  
+        return self.X.shape[0]
+    
+    def __getitem__(self, i):
+        return {
+            "X": torch.from_numpy(self.X[i]),
+            "E2": torch.from_numpy((self.Y[i]**2).astype(np.float32)),  # ENU误差的平方
+            "MASK": torch.from_numpy(self.mask[i].astype(np.float32)),
+            "Y": torch.from_numpy(self.Y[i])  # 真实方差（如果需要）
+        }
+
+def build_dataset(route: str, npz_path: str):
+    """数据集工厂函数"""
+    route = route.lower()
+    if route in ('acc', 'gyr', 'vis'):
+        return IMURouteDataset(npz_path, route=route, x_mode="both")
+    elif route == 'gns':
+        return GNSDataset(npz_path)
+    else:
+        raise ValueError(f"Unknown route {route}")
+
 def build_loader(npz_path, route="acc", x_mode="both",
                  batch_size=32, shuffle=True, num_workers=0):
-    ds = IMURouteDataset(npz_path, route=route, x_mode=x_mode)
+    if route.lower() == 'gns':
+        ds = build_dataset(route, npz_path)
+    else:
+        ds = IMURouteDataset(npz_path, route=route, x_mode=x_mode)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
     return ds, dl

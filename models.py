@@ -29,22 +29,23 @@ class TCNBlock(nn.Module):
     def forward(self, x):  # (B,C,T)
         return self.proj(x) + self.net(x)
 
-# ----- Model: (B,T,D) -> (B,T,1 logvar) -----
+# ----- Model: (B,T,D_in) -> (B,T,D_out logvar) -----
 class IMURouteModel(nn.Module):
-    def __init__(self, d_in: int, d_model: int=128, n_tcn: int=4, kernel_size:int=3,
+    def __init__(self, d_in: int, d_model: int=128, d_out: int=1, n_tcn: int=4, kernel_size:int=3,
                  dilations=(1,2,4,8), n_layers_tf: int=2, n_heads:int=4, dropout: float=0.1):
         super().__init__()
+        self.d_out = d_out
         self.inp = nn.Linear(d_in, d_model)
         self.tcn = nn.Sequential(*[TCNBlock(d_model, kernel_size=kernel_size, dilation=dilations[i%len(dilations)], dropout=dropout) for i in range(n_tcn)])
         enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_heads, dim_feedforward=d_model*4, dropout=dropout, activation="gelu", batch_first=True, norm_first=True)
         self.tf = nn.TransformerEncoder(enc_layer, num_layers=n_layers_tf)
-        self.head = nn.Linear(d_model, 1)
+        self.head = nn.Linear(d_model, d_out)
 
-    def forward(self, x):  # x: (B,T,D)
+    def forward(self, x):  # x: (B,T,D_in)
         h = self.inp(x)           # (B,T,C)
         h = h.transpose(1,2)      # (B,C,T) for TCN
         h = self.tcn(h)           # (B,C,T)
         h = h.transpose(1,2)      # (B,T,C)
         h = self.tf(h)            # (B,T,C)
-        logv = self.head(h)       # (B,T,1)
+        logv = self.head(h)       # (B,T,D_out)
         return logv

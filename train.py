@@ -17,12 +17,18 @@ def parse_args():
     args_pre, _ = pre.parse_known_args()
 
     cfg = load_config_file(args_pre.config)
-    tr = cfg.get("train", {})
-    md = cfg.get("model", {})
+    
+    # 根据路由读取不同的配置段
+    route_prefix = ""
+    if args_pre.config and "gns" in str(args_pre.config).lower():
+        route_prefix = "gns_"
+    
+    tr = cfg.get(f"train_{route_prefix}".rstrip("_"), cfg.get("train", {}))
+    md = cfg.get(f"model_{route_prefix}".rstrip("_"), cfg.get("model", {}))
     rt = cfg.get("runtime", {})
 
     ap = argparse.ArgumentParser("Train single-route IMU variance model", parents=[pre])
-    ap.add_argument("--route", choices=["acc","gyr","vis"], default=tr.get("route","acc"), help="Which route to train")
+    ap.add_argument("--route", choices=["acc","gyr","vis","gns"], default=tr.get("route","acc"), help="Which route to train")
     ap.add_argument("--train_npz", required=(tr.get("train_npz") is None), default=tr.get("train_npz"))
     ap.add_argument("--val_npz", required=(tr.get("val_npz") is None), default=tr.get("val_npz"))
     ap.add_argument("--test_npz", required=(tr.get("test_npz") is None), default=tr.get("test_npz"))
@@ -64,13 +70,22 @@ def main():
                                       batch_size=args.batch_size, shuffle=False,
                                       num_workers=args.num_workers)
 
-    if args.route == "vis":
+    # 动态确定输入/输出维度
+    if args.route == "gns":
+        # 对于GNSS，从数据集直接获取维度
+        sample_batch = next(iter(train_dl))
+        d_in = sample_batch["X"].shape[-1]
+        d_out = sample_batch["E2"].shape[-1]  # GNS: 3维 (ENU)
+    elif args.route == "vis":
         d_in = train_ds.X_all.shape[-1]
+        d_out = 1  # VIS: 1维聚合误差
     else:
         d_in = train_ds.X_all.shape[-1] if args.x_mode=="both" else 3
-    model = IMURouteModel(d_in=d_in, d_model=args.d_model, n_tcn=args.n_tcn, kernel_size=args.kernel_size,
+        d_out = 1  # IMU: 1维聚合误差
+    
+    model = IMURouteModel(d_in=d_in, d_out=d_out, d_model=args.d_model, n_tcn=args.n_tcn, kernel_size=args.kernel_size,
                           n_layers_tf=args.n_layers_tf, n_heads=args.n_heads, dropout=args.dropout).to(args.device)
-    print(f"[model] params={count_params(model):,}  d_in={d_in}")
+    print(f"[model] params={count_params(model):,}  d_in={d_in}  d_out={d_out}")
 
     opt = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     best_val = 1e9
@@ -88,22 +103,41 @@ def main():
             if args.route == "vis":
                 loss = nll_iso2_e2(batch["E2"], logv, m,
                                    logv_min=args.logv_min, logv_max=args.logv_max)
+            elif args.route == "gns":
+                # GNSS使用3维ENU损失
+                loss = nll_iso3_e2(batch["E2"], logv, m,
+                                   logv_min=args.logv_min, logv_max=args.logv_max)
             else:
+                # IMU (acc/gyr)
                 loss = nll_iso3_e2(batch["E2"], logv, m,
                                    logv_min=args.logv_min, logv_max=args.logv_max)
                 if args.anchor_weight > 0:
                     loss = loss + mse_anchor_1d(logv, y, m, lam=args.anchor_weight)
             
-            # z²居中正则化（通用于VIS和IMU）
+            # z²居中正则化（通用于所有路由）
             if args.z2_center > 0:
                 # 与 NLL 一致地 clamp，再求方差
                 lv = torch.clamp(logv, min=args.logv_min, max=args.logv_max)
                 v = torch.exp(lv).clamp_min(1e-12)
-                df = 2.0 if args.route == "vis" else 3.0
-                e2 = batch["E2"].squeeze(-1)
-                m_float = m.float().squeeze(-1)
                 
-                z2 = (e2 / v.squeeze(-1)) / df
+                # 根据路由确定自由度
+                if args.route == "vis":
+                    df = 2.0
+                elif args.route == "gns":
+                    df = 3.0  # ENU三维
+                else:
+                    df = 3.0  # IMU三维
+                
+                e2 = batch["E2"]
+                m_float = m.float()
+                
+                # 处理维度，确保兼容性
+                if e2.dim() == 3 and e2.shape[-1] == 1:
+                    e2 = e2.squeeze(-1)
+                    v = v.squeeze(-1)
+                    m_float = m_float.squeeze(-1)
+                
+                z2 = (e2 / v) / df
                 mean_z2 = (z2 * m_float).sum() / m_float.clamp_min(1.0).sum()
                 
                 # 目标值：高斯=1；若是 Student-t 则 nu/(nu-2)
@@ -135,6 +169,9 @@ def main():
             logv = model(val_batch["X"])
             if args.route == "vis":
                 stats = route_metrics_vis(val_batch["E2"], logv, val_batch["MASK"], args.logv_min, args.logv_max)
+            elif args.route == "gns":
+                # GNSS使用IMU指标函数（都是3维）
+                stats = route_metrics_imu(val_batch["E2"], logv, val_batch["MASK"], args.logv_min, args.logv_max)
             else:
                 stats = route_metrics_imu(val_batch["E2"], logv, val_batch["MASK"], args.logv_min, args.logv_max)
 
@@ -164,6 +201,8 @@ def main():
             logv = model(batch["X"])
             if args.route == "vis":
                 st = route_metrics_vis(batch["E2"], logv, batch["MASK"], args.logv_min, args.logv_max)
+            elif args.route == "gns":
+                st = route_metrics_imu(batch["E2"], logv, batch["MASK"], args.logv_min, args.logv_max)
             else:
                 st = route_metrics_imu(batch["E2"], logv, batch["MASK"], args.logv_min, args.logv_max)
             if agg is None: 
