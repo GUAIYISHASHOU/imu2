@@ -41,7 +41,8 @@ def parse_args():
     ap.add_argument("--num_workers", type=int, default=rt.get("num_workers",0))
     ap.add_argument("--logv_min", type=float, default=tr.get("logv_min",-12.0))
     ap.add_argument("--logv_max", type=float, default=tr.get("logv_max",6.0))
-    ap.add_argument("--z2_center", type=float, default=tr.get("z2_center",0.0), help="VIS路由z²居中正则化权重")
+    ap.add_argument("--z2_center", type=float, default=tr.get("z2_center",0.0), help="z²居中正则化权重")
+    ap.add_argument("--z2_center_target", type=str, default=tr.get("z2_center_target","auto"), help="z²目标值: 'auto' 或数字")
     ap.add_argument("--anchor_weight", type=float, default=tr.get("anchor_weight",0.0))
     ap.add_argument("--early_patience", type=int, default=tr.get("early_patience", 10))
     ap.add_argument("--device", default=rt.get("device","cuda" if torch.cuda.is_available() else "cpu"))
@@ -87,18 +88,31 @@ def main():
             if args.route == "vis":
                 loss = nll_iso2_e2(batch["E2"], logv, m,
                                    logv_min=args.logv_min, logv_max=args.logv_max)
-                # z²居中正则化：推动z²均值接近1
-                if args.z2_center > 0:
-                    v = torch.exp(logv).clamp_min(1e-12)
-                    z2 = (batch["E2"].squeeze(-1) / v.squeeze(-1)) / 2.0
-                    m_float = m.float()
-                    mean_z2 = (z2 * m_float).sum() / m_float.clamp_min(1.0).sum()
-                    loss = loss + args.z2_center * (mean_z2 - 1.0).pow(2)
             else:
                 loss = nll_iso3_e2(batch["E2"], logv, m,
                                    logv_min=args.logv_min, logv_max=args.logv_max)
                 if args.anchor_weight > 0:
                     loss = loss + mse_anchor_1d(logv, y, m, lam=args.anchor_weight)
+            
+            # z²居中正则化（通用于VIS和IMU）
+            if args.z2_center > 0:
+                # 与 NLL 一致地 clamp，再求方差
+                lv = torch.clamp(logv, min=args.logv_min, max=args.logv_max)
+                v = torch.exp(lv).clamp_min(1e-12)
+                df = 2.0 if args.route == "vis" else 3.0
+                e2 = batch["E2"].squeeze(-1)
+                m_float = m.float().squeeze(-1)
+                
+                z2 = (e2 / v.squeeze(-1)) / df
+                mean_z2 = (z2 * m_float).sum() / m_float.clamp_min(1.0).sum()
+                
+                # 目标值：高斯=1；若是 Student-t 则 nu/(nu-2)
+                if args.z2_center_target == "auto":
+                    target = 1.0  # 默认高斯目标
+                else:
+                    target = float(args.z2_center_target)
+                
+                loss = loss + args.z2_center * (mean_z2 - target).pow(2)
             if training:
                 opt.zero_grad(set_to_none=True)
                 loss.backward()

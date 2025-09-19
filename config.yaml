@@ -25,25 +25,58 @@ bicycle:
   timestamp_out: false   # ✅ 关键：关闭时间戳目录，路径与 train_npz 对齐
   no_split_routes: false
 
+# Visual+IMU generator (gen_bicycle_dual_vis.py)
+vis:
+  out: data_vis
+  seed: 42
+  traj_duration_s: 500
+  rate_hz: 100
+  train_routes: 6
+  val_routes: 2
+  test_routes: 2
+  cam_rate_hz: 10
+  img_w: 640
+  img_h: 480
+  fx: 400.0
+  fy: 400.0
+  cx: 320.0
+  cy: 240.0
+  vis_window: 32
+  vis_stride: 16
+  # —— 视觉噪声/难度参数（保持你现在的设置）——
+  noise_px: 0.35
+  noise_tau_s: 0.4
+  noise_ln_std: 0.35
+  outlier_ratio: 0.05
+  out_tau_s: 0.6
+  burst_prob: 0.03
+  burst_gain: [0.2, 0.6]
+  motion_k1: 0.8
+  motion_k2: 0.4
+  lp_pool_p: 3.0
+  min_match: 8
+
 # Training configuration (train.py)
 train:
   route: vis
   train_npz: data_vis/train_vis.npz
-  val_npz: data_vis/val_vis.npz
-  test_npz: data_vis/test_vis.npz
+  val_npz:   data_vis/val_vis.npz
+  test_npz:  data_vis/test_vis.npz
   run_dir: runs/vis
   epochs: 300
   batch_size: 32
   lr: 0.001
   x_mode: both
-  # target_mode: pooled2  # ❌ 删除（train.py 未使用）
-  logv_min: -12
-  logv_max: 4
   seed: 0
-  z2_center: 1e-3  # VIS路由z²居中正则化权重
-  # 需要的话可加：
+  # —— 标度与边界（按我们刚才的结论）——
+  logv_min: -14
+  logv_max: 4.5
+  # 轻正则：把 z² 从 ~0.91 拉回目标（高斯=1；Student-t 自动算 nu/(nu-2)）
+  z2_center: 1e-3
+  z2_center_target: auto
+  # 若你在 IMU 路由也训练，可考虑：
+  # anchor_weight: 0.002  # IMU 路由用作尺度锚；VIS 路由可不设
   # early_patience: 10
-  # anchor_weight: 0.0
 
 # Model architecture
 model:
@@ -63,33 +96,3 @@ eval:
   npz: data_vis/test_vis.npz
   model: runs/vis/best.pt
   x_mode: both
-
-# Visual+IMU generator (gen_bicycle_dual_vis.py)
-vis:
-  out: data_vis          
-  seed: 42
-  traj_duration_s: 500
-  rate_hz: 100
-  train_routes: 6
-  val_routes: 2
-  test_routes: 2
-  cam_rate_hz: 10
-  img_w: 640
-  img_h: 480
-  fx: 400.0
-  fy: 400.0
-  cx: 320.0
-  cy: 240.0
-  vis_window: 32   # 降到32，响应更快
-  vis_stride: 16
-  noise_px: 0.35
-  noise_tau_s: 0.4
-  noise_ln_std: 0.35
-  outlier_ratio: 0.05
-  out_tau_s: 0.6
-  burst_prob: 0.03
-  burst_gain: [0.2, 0.6]
-  motion_k1: 0.8
-  motion_k2: 0.4
-  lp_pool_p: 3.0
-  min_match: 8
