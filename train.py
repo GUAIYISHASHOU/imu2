@@ -8,7 +8,7 @@ from torch.optim import AdamW
 from utils import seed_everything, to_device, count_params, load_config_file
 from dataset import build_loader
 from models import IMURouteModel
-from losses import nll_iso3_e2, nll_iso2_e2, mse_anchor_1d, nll_diag_axes
+from losses import nll_iso3_e2, nll_iso2_e2, mse_anchor_1d, nll_diag_axes, nll_diag_axes_weighted
 from metrics import route_metrics_imu, route_metrics_vis, route_metrics_gns_axes
 
 def parse_args():
@@ -51,6 +51,15 @@ def parse_args():
     ap.add_argument("--z2_center_target", type=str, default=tr.get("z2_center_target","auto"), help="z²目标值: 'auto' 或数字")
     ap.add_argument("--anchor_weight", type=float, default=tr.get("anchor_weight",0.0))
     ap.add_argument("--early_patience", type=int, default=tr.get("early_patience", 10))
+    # 轴感知 & 自适应
+    ap.add_argument("--early_axis", action="store_true", default=tr.get("early_axis", True),
+                    help="使用'最差轴 |E[z²]-1|'做早停监控（GNSS）")
+    ap.add_argument("--axis_auto_balance", action="store_true", default=tr.get("axis_auto_balance", True),
+                    help="对 GNSS 逐轴 NLL 引入按轴权重，并按验证集 |E[z²]-1| 自适应更新")
+    ap.add_argument("--axis_power", type=float, default=tr.get("axis_power", 1.0),
+                    help="轴权重 ~ dev^p 的指数 p")
+    ap.add_argument("--axis_clip", type=str, default=tr.get("axis_clip", "0.5,2.0"),
+                    help="权重裁剪区间 lo,hi")
     ap.add_argument("--device", default=rt.get("device","cuda" if torch.cuda.is_available() else "cpu"))
     return ap.parse_args()
 
@@ -88,9 +97,14 @@ def main():
     print(f"[model] params={count_params(model):,}  d_in={d_in}  d_out={d_out}")
 
     opt = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    best_val = 1e9
+    best_val = 1e9   # 兼容原有基于 val_loss 的逻辑
+    best_worst = 1e9 # 轴感知用
     epochs_since_improve = 0
     best_path = str(Path(args.run_dir) / "best.pt")
+    
+    # 轴权重（仅 GNSS 生效）
+    lo, hi = map(float, args.axis_clip.split(","))
+    axis_w = torch.ones(3, device=args.device)
 
     def run_epoch(loader, training: bool):
         model.train(training)
@@ -104,9 +118,14 @@ def main():
                 loss = nll_iso2_e2(batch["E2"], logv, m,
                                    logv_min=args.logv_min, logv_max=args.logv_max)
             elif args.route == "gns":
-                # GNSS：逐轴各向异性 NLL（E/N/U 三通道）
-                loss = nll_diag_axes(batch["E2_AXES"], logv, batch["MASK_AXES"],
-                                     logv_min=args.logv_min, logv_max=args.logv_max)
+                # GNSS：逐轴各向异性（可选按轴加权）
+                if args.axis_auto_balance:
+                    loss, per_axis_nll = nll_diag_axes_weighted(batch["E2_AXES"], logv, batch["MASK_AXES"],
+                                                                axis_w=axis_w,
+                                                                logv_min=args.logv_min, logv_max=args.logv_max)
+                else:
+                    loss = nll_diag_axes(batch["E2_AXES"], logv, batch["MASK_AXES"],
+                                         logv_min=args.logv_min, logv_max=args.logv_max)
             else:
                 # IMU (acc/gyr)
                 loss = nll_iso3_e2(batch["E2"], logv, m,
@@ -175,12 +194,49 @@ def main():
             else:
                 stats = route_metrics_imu(val_batch["E2"], logv, val_batch["MASK"], args.logv_min, args.logv_max)
 
-        print(f"[epoch {epoch:03d}] train_loss={tr_loss:.4f}  val_loss={val_loss:.4f}  "
-              f"z2_mean={stats['z2_mean']:.3f} cov68={stats['cov68']:.3f} cov95={stats['cov95']:.3f} "
-              f"spear={stats['spear']:.3f} sat={stats['sat']:.3f}  time={time.time()-t0:.1f}s")
+            # === 轴感知统计（GNSS）===
+            worst_dev = None
+            ez2_axes_print = ""
+            if args.route == "gns":
+                num = torch.zeros(3, device=args.device)
+                den = torch.zeros(3, device=args.device)
+                for val_batch in val_dl:
+                    val_batch = to_device(val_batch, args.device)
+                    logv = model(val_batch["X"])                     # (B,T,3)
+                    lv = torch.clamp(logv, min=args.logv_min, max=args.logv_max)
+                    v  = torch.exp(lv).clamp_min(1e-12)
+                    e2 = val_batch["E2_AXES"]                        # (B,T,3)
+                    m  = val_batch["MASK_AXES"].float()              # (B,T,3)
+                    z2 = e2 / v
+                    num += (z2 * m).sum(dim=(0,1))
+                    den += m.sum(dim=(0,1)).clamp_min(1.0)
+                ez2_axes = (num / den).detach()                      # (3,)
+                worst_dev = torch.abs(ez2_axes - 1.0).max().item()
+                ez2_axes_print = f" ez2[E,N,U]=[{ez2_axes[0]:.3f},{ez2_axes[1]:.3f},{ez2_axes[2]:.3f}] worst={worst_dev:.3f}"
 
-        if val_loss < best_val:
-            best_val = val_loss
+                # 按轴自适应权重（B）：谁偏得远谁更重
+                if args.axis_auto_balance:
+                    dev = (ez2_axes - 1.0).abs().clamp_min(1e-3)     # (3,)
+                    new_w = dev.pow(args.axis_power)
+                    new_w = (new_w / new_w.mean()).clamp_(lo, hi)     # 归一 + 裁剪
+                    axis_w = new_w.detach()
+
+        print(f"[epoch {epoch:03d}] train_loss={tr_loss:.4f}  val_loss={val_loss:.4f}"
+              f" z2_mean={stats['z2_mean']:.3f} cov68={stats['cov68']:.3f} cov95={stats['cov95']:.3f} "
+              f"spear={stats['spear']:.3f} sat={stats['sat']:.3f}{ez2_axes_print}  time={time.time()-t0:.1f}s")
+
+        # === A：轴感知早停 ===
+        improved = False
+        if args.route == "gns" and args.early_axis and worst_dev is not None:
+            if epoch == 1 or worst_dev < best_worst:
+                best_worst = worst_dev
+                improved = True
+        else:
+            if val_loss < best_val:
+                best_val = val_loss
+                improved = True
+
+        if improved:
             epochs_since_improve = 0
             torch.save({"model": model.state_dict(), "args": vars(args)}, best_path)
         else:

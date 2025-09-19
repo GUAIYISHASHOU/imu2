@@ -9,6 +9,11 @@ multi:
   # 严格共轨迹的握手文件（可选）
   save_routes_meta: data_cache/routes_meta.json   # 生成时保存
   routes_meta: null                               # 复现时读取
+  
+  # 轨迹可视化
+  plot_trajectories: true             # 生成真值轨迹图
+  plot_individual: false              # 为每条轨迹生成单独的图（可选）
+  plot_dir: trajectory_plots          # 轨迹图保存目录
 
   # 输出目录
   imu_out: data_cache
@@ -32,11 +37,11 @@ multi:
   base_sigma_en: [0.7, 0.7]
   base_sigma_u: 1.8
   scene_bounds: [400, 400, 400, 400, 400]
-  scene_gain_en: [1.0, 2.5, 4.0, 1.5, 1.0]
-  scene_gain_u:  [1.8, 3.5, 5.0, 2.0, 1.8]
-  omega: 0.05
-  alpha: 0.35
-  beta: 0.45
+  scene_gain_en: [1.0, 1.5, 2.0, 1.2, 1.0]
+  scene_gain_u:  [1.2, 1.8, 2.5, 1.5, 1.2]
+  omega: 0.01
+  alpha: 0.15
+  beta: 0.75
   p_out: 0.03
   t_df: 3.0
   vendor_bias: 1.4
@@ -59,6 +64,12 @@ train_gns:
   logv_max: 5
   z2_center: 1e-3
   z2_center_target: 1.0   # GNSS 用高斯目标=1
+  
+  # 轴感知早停和按轴自适应加权
+  early_axis: true        # 使用"最差轴 |E[z²]-1|"做早停监控
+  axis_auto_balance: true # 按轴权重自适应调整
+  axis_power: 1.0         # 轴权重 ~ dev^p 的指数p
+  axis_clip: "0.5,2.0"    # 权重裁剪区间 [lo,hi]
 
 model_gns:
   d_model: 128

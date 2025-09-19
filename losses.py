@@ -60,3 +60,24 @@ def nll_diag_axes(e2_axes: torch.Tensor, logv_axes: torch.Tensor, mask_axes: tor
     num = (nll * m).sum()
     den = torch.clamp(m.sum(), min=1.0)
     return num / den
+
+def nll_diag_axes_weighted(e2_axes: torch.Tensor, logv_axes: torch.Tensor, mask_axes: torch.Tensor,
+                           axis_w: torch.Tensor=None,
+                           logv_min: float=-16.0, logv_max: float=6.0):
+    """
+    各向异性对角高斯 NLL（逐轴）+ 按轴权重。
+    e2_axes, logv_axes, mask_axes: (B,T,3)
+    axis_w: (3,) 归一到均值=1 更稳（外部可先做归一化）
+    """
+    lv = torch.clamp(logv_axes, min=logv_min, max=logv_max)
+    inv_v = torch.exp(-lv)                    # (B,T,3)
+    nll_axes = 0.5 * (e2_axes * inv_v + lv)  # (B,T,3)
+    m = mask_axes.float()
+    num = nll_axes.mul(m).sum(dim=(0,1))      # (3,)
+    den = m.sum(dim=(0,1)).clamp_min(1.0)     # (3,)
+    per_axis = num / den                       # (3,)
+    if axis_w is None:
+        axis_w = torch.ones_like(per_axis)
+    # 归一到均值=1，便于 lr 稳定
+    axis_w = axis_w * (3.0 / axis_w.sum().clamp_min(1e-6))
+    return (per_axis * axis_w).sum(), per_axis.detach()

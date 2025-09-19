@@ -17,6 +17,7 @@ from __future__ import annotations
 import os, json, math, argparse, random
 from pathlib import Path
 import numpy as np
+import matplotlib.pyplot as plt
 from utils import load_config_file
 
 # ----------------- 小工具 -----------------
@@ -25,6 +26,120 @@ def set_seed(seed: int):
 
 def ensure_dir(p):
     Path(p).mkdir(parents=True, exist_ok=True)
+
+def plot_trajectory(traj, title="", save_path=None):
+    """绘制2D轨迹图"""
+    gt_enu = traj["gt_enu"]
+    t = traj["t"]
+    
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle(title, fontsize=14)
+    
+    # 1. 2D轨迹图 (E-N平面)
+    axes[0,0].plot(gt_enu[:,0], gt_enu[:,1], 'b-', linewidth=1)
+    axes[0,0].plot(gt_enu[0,0], gt_enu[0,1], 'go', markersize=8, label='Start')
+    axes[0,0].plot(gt_enu[-1,0], gt_enu[-1,1], 'ro', markersize=8, label='End')
+    axes[0,0].set_xlabel('East (m)')
+    axes[0,0].set_ylabel('North (m)')
+    axes[0,0].set_title('2D Trajectory (E-N)')
+    axes[0,0].grid(True, alpha=0.3)
+    axes[0,0].legend()
+    axes[0,0].axis('equal')
+    
+    # 2. 高度时序
+    axes[0,1].plot(t/60, gt_enu[:,2], 'g-', linewidth=1)
+    axes[0,1].set_xlabel('Time (min)')
+    axes[0,1].set_ylabel('Up (m)')
+    axes[0,1].set_title('Altitude Profile')
+    axes[0,1].grid(True, alpha=0.3)
+    
+    # 3. 速度时序
+    speed = traj.get("speed", np.zeros(len(t)))
+    axes[1,0].plot(t/60, speed, 'r-', linewidth=1)
+    axes[1,0].set_xlabel('Time (min)')
+    axes[1,0].set_ylabel('Speed (m/s)')
+    axes[1,0].set_title('Speed Profile')
+    axes[1,0].grid(True, alpha=0.3)
+    
+    # 4. 航向时序
+    yaw = traj.get("yaw", np.zeros(len(t)))
+    axes[1,1].plot(t/60, np.degrees(yaw), 'purple', linewidth=1)
+    axes[1,1].set_xlabel('Time (min)')
+    axes[1,1].set_ylabel('Yaw (deg)')
+    axes[1,1].set_title('Heading Profile')
+    axes[1,1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+    else:
+        plt.show()
+
+def plot_all_trajectories(trajectories, split_name, save_dir):
+    """绘制一个split中所有轨迹的概览图"""
+    if not trajectories:
+        return
+        
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    fig.suptitle(f'{split_name.title()} Set Trajectories Overview ({len(trajectories)} routes)', fontsize=16)
+    
+    colors = plt.cm.tab10(np.linspace(0, 1, len(trajectories)))
+    
+    # 1. 所有轨迹的2D图
+    for i, traj in enumerate(trajectories):
+        gt_enu = traj["gt_enu"]
+        axes[0,0].plot(gt_enu[:,0], gt_enu[:,1], color=colors[i], linewidth=1, 
+                      label=f'Route {i}', alpha=0.7)
+        # 起点标记
+        axes[0,0].plot(gt_enu[0,0], gt_enu[0,1], 'o', color=colors[i], markersize=6)
+    
+    axes[0,0].set_xlabel('East (m)')
+    axes[0,0].set_ylabel('North (m)')
+    axes[0,0].set_title('All 2D Trajectories')
+    axes[0,0].grid(True, alpha=0.3)
+    axes[0,0].legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    axes[0,0].axis('equal')
+    
+    # 2. 高度分布
+    for i, traj in enumerate(trajectories):
+        axes[0,1].plot(traj["t"]/60, traj["gt_enu"][:,2], color=colors[i], 
+                      linewidth=1, alpha=0.7, label=f'Route {i}')
+    axes[0,1].set_xlabel('Time (min)')
+    axes[0,1].set_ylabel('Up (m)')
+    axes[0,1].set_title('Altitude Profiles')
+    axes[0,1].grid(True, alpha=0.3)
+    
+    # 3. 速度分布
+    for i, traj in enumerate(trajectories):
+        speed = traj.get("speed", np.zeros(len(traj["t"])))
+        axes[1,0].plot(traj["t"]/60, speed, color=colors[i], 
+                      linewidth=1, alpha=0.7, label=f'Route {i}')
+    axes[1,0].set_xlabel('Time (min)')
+    axes[1,0].set_ylabel('Speed (m/s)')
+    axes[1,0].set_title('Speed Profiles')
+    axes[1,0].grid(True, alpha=0.3)
+    
+    # 4. 轨迹统计
+    stats_text = []
+    for i, traj in enumerate(trajectories):
+        gt_enu = traj["gt_enu"]
+        total_dist = np.sum(np.linalg.norm(np.diff(gt_enu[:,:2], axis=0), axis=1))
+        max_speed = np.max(traj.get("speed", [0]))
+        duration = traj["t"][-1] / 60
+        stats_text.append(f'Route {i}: {total_dist:.1f}m, {max_speed:.1f}m/s, {duration:.1f}min')
+    
+    axes[1,1].text(0.05, 0.95, '\n'.join(stats_text), transform=axes[1,1].transAxes,
+                   fontsize=10, verticalalignment='top', fontfamily='monospace')
+    axes[1,1].set_title('Trajectory Statistics')
+    axes[1,1].axis('off')
+    
+    plt.tight_layout()
+    save_path = Path(save_dir) / f"{split_name}_trajectories_overview.png"
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved trajectory overview: {save_path}")
 
 def rolling_window_idx(N, T, S):
     out = []
@@ -133,6 +248,10 @@ def garch_envelope(T, base_en=(0.7,0.7), base_u=1.8,
             varE[t] = (omega + alpha*(eE_prev**2) + beta*varE[t-1]) * (g_en[t]**2)
             varN[t] = (omega + alpha*(eN_prev**2) + beta*varN[t-1]) * (g_en[t]**2)
             varU[t] = (omega + alpha*(eU_prev**2) + beta*varU[t-1]) * (g_u [t]**2)
+            # 数值稳定性：限制方差上限
+            varE[t] = min(varE[t], 1e6)
+            varN[t] = min(varN[t], 1e6)
+            varU[t] = min(varU[t], 1e6)
         else:
             varE[t] = (sigE0*g_en[t])**2
             varN[t] = (sigN0*g_en[t])**2
@@ -145,6 +264,8 @@ def garch_envelope(T, base_en=(0.7,0.7), base_u=1.8,
 def synth_vendor_std(true_sigma, bias=1.4, ln_jitter=0.2, seed=0):
     rng = np.random.default_rng(seed+999)
     ln_noise = rng.normal(0.0, ln_jitter, size=true_sigma.shape)
+    # 限制对数噪声避免极端值
+    ln_noise = np.clip(ln_noise, -3.0, 3.0)
     return bias * true_sigma * np.exp(ln_noise)
 
 def sample_gnss(gt_1hz, sigma_true, p_out=0.03, t_df=3.0, seed=0):
@@ -154,7 +275,12 @@ def sample_gnss(gt_1hz, sigma_true, p_out=0.03, t_df=3.0, seed=0):
     mask_out = rng.random(T) < p_out
     if np.any(mask_out):
         scale = sigma_true[mask_out] * 6.0
-        eps[mask_out] += rng.standard_t(df=t_df, size=scale.shape) * scale
+        # 限制t分布的尺度参数避免极端值
+        scale = np.clip(scale, 0, 100.0)
+        t_noise = rng.standard_t(df=t_df, size=scale.shape)
+        # 限制t分布噪声避免极端值
+        t_noise = np.clip(t_noise, -10.0, 10.0)
+        eps[mask_out] += t_noise * scale
     return gt_1hz + eps
 
 def build_gns_features(tr_1hz, vendor):
@@ -164,6 +290,8 @@ def build_gns_features(tr_1hz, vendor):
     dyaw = np.zeros_like(yaw); dyaw[1:] = yaw[1:] - yaw[:-1]
     base = np.column_stack([dpos, speed, dyaw])  # (T,5)
     feats = np.concatenate([vendor, base], axis=1)  # (T, 3+5) = 8
+    # 限制特征值避免极端值
+    feats = np.clip(feats, -1e6, 1e6)
     return feats.astype(np.float32)
 
 # ----------------- 主流程 -----------------
@@ -221,6 +349,14 @@ def main():
     # 严格共轨迹
     ap.add_argument("--save_routes_meta", default=multi.get("save_routes_meta", None))
     ap.add_argument("--routes_meta", default=multi.get("routes_meta", None))
+    
+    # 轨迹可视化
+    ap.add_argument("--plot_trajectories", action="store_true", default=multi.get("plot_trajectories", True),
+                    help="生成真值轨迹图")
+    ap.add_argument("--plot_individual", action="store_true", default=multi.get("plot_individual", False), 
+                    help="为每条轨迹生成单独的图")
+    ap.add_argument("--plot_dir", default=multi.get("plot_dir", "trajectory_plots"),
+                    help="轨迹图保存目录")
     args = ap.parse_args()
 
     ensure_dir(args.imu_out); ensure_dir(args.vis_out); ensure_dir(args.gns_out)
@@ -237,6 +373,9 @@ def main():
         GYR_Xs, GYR_Ys, GYR_Ms = [], [], []
         VIS_Xs, VIS_Ys, VIS_Ms = [], [], []
         GNS_Xs, GNS_Ys, GNS_Ms = [], [], []
+        
+        # 轨迹存储（用于可视化）
+        trajectories = []
 
         for r in range(R):
             route_seed = route_meta.get("routes", {}).get(f"{split}_{r}",
@@ -250,6 +389,10 @@ def main():
             tr_100 = traj
             tr_10  = downsample(traj, out_hz=10)
             tr_1   = downsample(traj, out_hz=1)
+            
+            # 存储轨迹用于可视化
+            if args.plot_trajectories:
+                trajectories.append(traj)
 
             # ---------- IMU ----------
             acc, gyr = imu_from_traj(tr_100, seed=route_seed+11)
@@ -320,6 +463,23 @@ def main():
             np.savez_compressed(Path(args.gns_out)/f"{split}_gns.npz", X=X, Y=Y, mask=M,
                 meta=json.dumps({"route":"gns","win":args.gns_win,"stride":args.gns_stride}))
             print(f"[{split}] gns  {X.shape} {Y.shape}")
+        
+        # === 轨迹可视化 ===
+        if args.plot_trajectories and trajectories:
+            ensure_dir(args.plot_dir)
+            
+            # 生成概览图
+            plot_all_trajectories(trajectories, split, args.plot_dir)
+            
+            # 可选：生成单独轨迹图
+            if args.plot_individual:
+                split_dir = Path(args.plot_dir) / split
+                ensure_dir(split_dir)
+                for i, traj in enumerate(trajectories):
+                    title = f"{split.title()} Route {i} (seed={route_meta['routes'][f'{split}_{i}']})"
+                    save_path = split_dir / f"route_{i:02d}.png"
+                    plot_trajectory(traj, title=title, save_path=save_path)
+                print(f"Saved {len(trajectories)} individual trajectory plots in {split_dir}")
 
     if args.save_routes_meta:
         Path(args.save_routes_meta).write_text(json.dumps(route_meta, indent=2))
