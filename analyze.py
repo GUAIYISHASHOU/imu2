@@ -28,7 +28,7 @@ def main():
     if args.route == "gns":
         sample_batch = next(iter(dl))
         d_in = sample_batch["X"].shape[-1]
-        d_out = 1                      # ← GNSS 等方差：单通道 logv
+        d_out = 3                      # ← 各向异性 ENU
     elif args.route == "vis":
         d_in = ds.X_all.shape[-1]
         d_out = 1
@@ -53,27 +53,35 @@ def main():
         batch = next(iter(dl))
         batch = to_device(batch, args.device)
         logv = model(batch["X"])
-        if logv.dim() == 3 and logv.size(-1) == 1:
-            logv = logv.squeeze(-1)
-        var = torch.exp(logv)
-        e2sum = batch["E2"]
-        if e2sum.dim() == 3 and e2sum.size(-1) == 1:
-            e2sum = e2sum.squeeze(-1)
-        mask = batch["MASK"]
-        if mask.dim() == 3 and mask.size(-1) == 1:
-            mask = mask.squeeze(-1)
-        mask = mask.float()
         if args.route == "vis":
             df = 2.0
-        elif args.route == "gns":
-            df = 3.0  # ENU三维
         else:
             df = 3.0  # IMU三维
-        z2 = (e2sum / var) / df
-        mask_flat = mask > 0.5
+
+        # --- GNSS: 逐轴 ---
+        if args.route == "gns":
+            var_axes = torch.exp(logv)                      # (B,T,3)
+            e2_axes  = batch["E2_AXES"]                     # (B,T,3)
+            m_axes   = batch["MASK_AXES"].float()           # (B,T,3)
+            z2_axes  = e2_axes / torch.clamp(var_axes, 1e-12)
+            mask_flat = (m_axes > 0.5)
+            z2_np = z2_axes[mask_flat].detach().cpu().numpy().reshape(-1)
+        else:
+            if logv.dim() == 3 and logv.size(-1) == 1:
+                logv = logv.squeeze(-1)
+            var = torch.exp(logv)
+            e2sum = batch["E2"]
+            if e2sum.dim() == 3 and e2sum.size(-1) == 1:
+                e2sum = e2sum.squeeze(-1)
+            mask = batch["MASK"]
+            if mask.dim() == 3 and mask.size(-1) == 1:
+                mask = mask.squeeze(-1)
+            mask = mask.float()
+            z2 = (e2sum / var) / df
+            mask_flat = mask > 0.5
+            z2_np = z2[mask_flat].detach().cpu().numpy().reshape(-1)
 
         # Plot 1: histogram of z^2
-        z2_np = z2[mask_flat].detach().cpu().numpy().reshape(-1)
         plt.figure()
         plt.hist(z2_np, bins=100)
         plt.title(f"z^2 (df={int(df)}) - route={args.route}")
@@ -86,16 +94,21 @@ def main():
         # Plot 2: scatter err^2 vs var
         if args.use_loglog:
             # 对数散点图：逐窗口散点 + 对数坐标
-            m = mask.reshape(-1, mask.shape[-1])  # (B*T, D)
-            e2_flat = e2sum.reshape(-1, e2sum.shape[-1])  # (B*T, D)
-            var_flat = var.reshape(-1, var.shape[-1])     # (B*T, D)
+            if args.route == "gns":
+                m = m_axes.reshape(-1, m_axes.shape[-1])      # (B*T,3)
+                e2_flat = e2_axes.reshape(-1, e2_axes.shape[-1])
+                var_flat = var_axes.reshape(-1, var_axes.shape[-1])
+            else:
+                m = mask.reshape(-1, mask.shape[-1])          # (B*T,1)
+                e2_flat = e2sum.reshape(-1, e2sum.shape[-1])
+                var_flat = var.reshape(-1, var.shape[-1])
             
             # 应用mask过滤
             valid_mask = m > 0.5
             e2_valid = e2_flat[valid_mask]
             var_valid = var_flat[valid_mask]
             
-            # 如果是多维，取均值聚合到标量
+            # 多维（GNSS 3轴）取逐轴平均合成一个散点
             if e2_valid.dim() > 1 and e2_valid.shape[-1] > 1:
                 e2s = e2_valid.mean(dim=-1)
                 vps = var_valid.mean(dim=-1)
@@ -130,42 +143,33 @@ def main():
 
         # Plot 3: time series of logvar (first few sequences)
         if args.route == "gns":
-            # GNSS: 等方差时序图 + 逐维分析
+            # GNSS: 三轴 logvar 时序 + 逐维指标表
             import json
             import numpy as np
-            
-            # squeeze 到 2D：(B,T)
-            if logv.dim()==3 and logv.size(-1)==1: 
-                logv = logv.squeeze(-1)
-            if e2sum.dim()==3 and e2sum.size(-1)==1: 
-                e2sum = e2sum.squeeze(-1)
-            if mask.dim()==3 and mask.size(-1)==1: 
-                mask = mask.squeeze(-1)
+            lv = logv.detach().cpu().numpy()            # (B,T,3)
 
-            var = torch.exp(logv).clamp_min(1e-12)      # (B,T)
-            lv = logv.detach().cpu().numpy()
-            
-            # 等方差时序图（单条线）
+            # 三轴 logvar（展示第一个序列）
             plt.figure()
-            plt.plot(lv[0], label='logvar (isotropic)')  # 只显示第一个序列
+            for d, name in enumerate(['E','N','U']):
+                plt.plot(lv[0,:,d], label=f'logvar {name}')
             plt.legend()
-            plt.title('log variance (isotropic ENU)')
+            plt.title('GNSS log variance (anisotropic ENU)')
             plt.xlabel("t")
             plt.ylabel("log(var)")
             plt.tight_layout()
             plt.savefig(os.path.join(args.out, "timeseries_logvar.png"))
             plt.close()
             
-            # 逐维表：用逐轴误差 + 同一标量方差
+            # 逐维表：用逐轴误差 + 逐轴方差
             y_axes = batch["Y"].detach().cpu().numpy()                 # (B,T,3)
-            m_axes = batch.get("MASK_AXES", batch["MASK"]).detach().cpu().numpy()  # (B,T,3) or (B,T,1)
-            v_np   = var.detach().cpu().numpy()                        # (B,T)
+            m_axes = batch["MASK_AXES"].detach().cpu().numpy()         # (B,T,3)
+            v_np   = torch.exp(logv).detach().cpu().numpy()            # (B,T,3)
 
             names = ['E','N','U']
             per_axis = []
             for d, nm in enumerate(names):
-                m = (m_axes[..., d] > 0.5) if m_axes.ndim==3 else (m_axes.squeeze(-1) > 0.5)
-                z2d = ( (y_axes[..., d]**2) / np.maximum(v_np, 1e-12) )[m]
+                m = (m_axes[..., d] > 0.5)
+                z2d = ( (y_axes[..., d]**2) / np.maximum(v_np[..., d], 1e-12) )[m]
                 per_axis.append({
                     "axis": nm,
                     "Ez2": float(np.mean(z2d)),

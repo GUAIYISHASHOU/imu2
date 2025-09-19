@@ -1,231 +1,478 @@
-1) dataset.py：新增 GNSS 数据集 & 工厂注册
+下面给出“最小侵入式改法”：把 GNSS 从 1 个方差改为 E/N/U 三个方差（对角各向异性）。改动集中在 5 个文件，其他文件不动。都是可直接粘贴的补丁。
 
-目标：读入 data_gns/{train,val,test}_gns.npz（字段含 X, Y, mask），并在 build_dataset 支持 route='gns'。
+一、losses.py 新增“逐轴对角 NLL”
 
-把下面两段加进 dataset.py（第一段是一个新类，第二段是工厂里的新增分支）。如果你的文件里已有类似工厂函数，按注释把 “gns” case 粘进去即可。
+在文件末尾添加一个函数（不影响原有接口）：
 
-# === 1) 新增：GNSS 数据集（ENU三维） =========================
-import numpy as np
-from torch.utils.data import Dataset
-
-class GNSDataset(Dataset):
-    def __init__(self, npz_path: str):
-        z = np.load(npz_path, allow_pickle=True)
-        self.X   = z['X'].astype(np.float32)     # (N, T, Din)
-        self.Y   = z['Y'].astype(np.float32)     # (N, T, 3)  ENU误差
-        self.mask= z['mask'].astype(bool)        # (N, T, 3)
-        self.meta= z.get('meta', None)
-        assert self.X.shape[0] == self.Y.shape[0] == self.mask.shape[0]
-        assert self.Y.shape[-1] == 3, "GNS Y should be (..,3) for ENU"
-    def __len__(self):  return self.X.shape[0]
-    def __getitem__(self, i):
-        return self.X[i], self.Y[i], self.mask[i]
-
-# === 2) 在数据集工厂中注册 route='gns' =======================
-def build_dataset(route: str, split_npz: str):
-    route = route.lower()
-    if route in ('acc','gyr','vis'):
-        # 你现有的分支保持不动
-        ...
-    elif route == 'gns':
-        return GNSDataset(split_npz)
-    else:
-        raise ValueError(f"Unknown route {route}")
-
-2) train.py：让模型&损失自适应 D=3，并支持 route='gns'
-
-目标：不改你原有的 acc/gyr/vis 流程，只是让 --route gns 走同一套训练，自动从批数据读出 Din/D。
-
-在 train.py 中做三处最小改动：
-
-(A) argparse 的 route choices 加上 gns
-ap.add_argument('--route', type=str, default='vis',
-                choices=['acc','gyr','vis','gns'])
-
-(B) 动态确定输入/输出维度，构建模型
-
-在你创建模型的地方（通常拿到 train_loader 之后），补上：
-
-# 取一个batch来确定 Din / D
-xb, yb, mb = next(iter(train_loader))
-Din = xb.shape[-1]     # 输入维度
-D   = yb.shape[-1]     # 输出维度（VIS=2, GNS=3, IMU=3）
-
-# 如果你的 models.py 里 Model 类接收 d_in / d_out，请按你工程实际命名传入
-model = Model(d_in=Din, d_model=cfg['model'].get('d_model',128),
-              d_out=D,
-              n_tcn=cfg['model'].get('n_tcn',4),
-              kernel_size=cfg['model'].get('kernel_size',3),
-              n_layers_tf=cfg['model'].get('n_layers_tf',2),
-              n_heads=cfg['model'].get('n_heads',4),
-              dropout=cfg['model'].get('dropout',0.1)).to(device)
+*** a/losses.py
+--- b/losses.py
+@@
+ def mse_anchor_1d(logv: torch.Tensor, y_var: torch.Tensor, mask: torch.Tensor, lam: float=1e-3) -> torch.Tensor:
+@@
+     return lam * se.sum() / torch.clamp(m.sum(), min=1.0)
++
++def nll_diag_axes(e2_axes: torch.Tensor, logv_axes: torch.Tensor, mask_axes: torch.Tensor,
++                  logv_min: float=-16.0, logv_max: float=6.0) -> torch.Tensor:
++    """
++    各向异性对角高斯 NLL（逐轴）。适用于 GNSS ENU 三轴。
++    e2_axes  : (B,T,3)   每轴误差平方
++    logv_axes: (B,T,3)   每轴 log(σ^2)
++    mask_axes: (B,T,3)   每轴有效掩码
++    """
++    lv = torch.clamp(logv_axes, min=logv_min, max=logv_max)
++    inv_v = torch.exp(-lv)                 # (B,T,3)
++    nll = 0.5 * (e2_axes * inv_v + lv)    # (B,T,3)
++    m = mask_axes.float()
++    num = (nll * m).sum()
++    den = torch.clamp(m.sum(), min=1.0)
++    return num / den
 
 
-注：如果你当前 Model 构造函数里没有 d_in/d_out 参数，而是写死的，请在 models.py 增加这两个参数，并把最后线性头 nn.Linear(d_model, d_out) 按 D 建。其它不需要动。
+现有的 nll_iso3_e2/nll_iso2_e2 保留不动，IMU/VIS 训练不受影响。
 
-(C) 损失与约束，沿用现有逻辑
+二、models.py：无需改动模型结构
 
-你已有的 NLL 和 z2_center 约束通常是逐维独立地做的（对最后一维 D 循环或向量化）。不需要为 GNS 特别改；只要确保：
+你的 IMURouteModel 已经是通用 d_out 头，能输出任意维度（最终一层 self.head = nn.Linear(d_model, d_out)）。我们只需要在训练/评测里把 GNSS 的 d_out 设为 3。
 
-logv_min/logv_max 读自配置；
+三、train.py：GNSS 设 d_out=3 并用逐轴 NLL
 
-z2_center_target 对 高斯=1.0，默认即可；
+构建模型时把 GNSS 的 d_out 从 1 改为 3；
 
-不要对 mask 做 squeeze（确保 mask 的最后一维是 D）。
+计算损失时，GNSS 用 batch["E2_AXES"] 与 batch["MASK_AXES"] + 新的 nll_diag_axes；
 
-3) eval.py：打印整体指标 + 逐维 ENU 覆盖率，并输出 JSON
+z² 居中正则对 GNSS 用逐轴 e2_axes/var_axes（不再除以 df=3）。
 
-目标：当 --route gns 时，既打印原有整体指标（z2_mean, cov68, cov95, spear, sat…），也逐维给出 E[z²] 与覆盖率表，并把两者一起以 JSON 打印/保存。
-
-把下面这段加入 eval.py 的评测输出逻辑里（保持你原有指标统计函数不变，只是多一段“逐维切片”）：
-
-import json, numpy as np
-# 假设 err2, var_pred, mask 已算好，形状 (N,T,D)
-
-def coverage(err2, var, q=0.95):
-    # 误差^2 <= q分位的理论阈值？若用高斯→阈=chi2(D=1)或逐维各自；你现有实现怎么做就用它
-    # 这里按逐维：err2/var <= thresh(=3.841 for 95%) 的比例
-    from scipy.stats import chi2
-    thr = chi2.ppf(q, df=1)
-    return np.mean((err2/np.maximum(var,1e-12)) <= thr)
-
-D = err2.shape[-1]
-results = {
-  "z2_mean": float(np.mean(err2/np.maximum(var_pred,1e-12))),
-  "cov68": float(coverage(err2, var_pred, 0.68)),
-  "cov95": float(coverage(err2, var_pred, 0.95)),
-  "spear": float(spearmanr(err2.reshape(-1), var_pred.reshape(-1)).correlation),
-  "sat": float(np.mean(np.isclose(np.log(var_pred), LOGV_MIN, atol=1e-6))),
-  "sat_min": float(np.mean(np.log(var_pred) <= LOGV_MIN + 1e-6)),
-  "sat_max": float(np.mean(np.log(var_pred) >= LOGV_MAX - 1e-6)),
-}
-
-# —— 逐维 ENU —— #
-per_axis = []
-axis_names = ['E','N','U'] if D==3 else (['x','y'] if D==2 else [f'd{i}' for i in range(D)])
-for d in range(D):
-    m = mask[..., d]
-    e2 = err2[..., d][m]
-    vp = var_pred[..., d][m]
-    z2 = e2/np.maximum(vp,1e-12)
-    per_axis.append({
-        "axis": axis_names[d],
-        "Ez2": float(np.mean(z2)),
-        "cov68": float(np.mean(z2 <= 1.0)), # 高斯1维: 68% ≈ z^2<=1
-        "cov95": float(np.mean(z2 <= 3.841)), # 95% 阈值
-        "count": int(e2.size)
-    })
-results["per_axis"] = per_axis
-
-print(json.dumps(results, indent=2, ensure_ascii=False))
-# 可选：保存到 runs/<route>/eval_<split>.json
-
-
-你已经在 VIS 路由上输出过整体指标；这段只是把“逐维 ENU”补上并融合输出为一个 JSON。
-
-4) analyze.py：新增 GNSS 的图——直方图、散点（log-log）、时序 + 逐维表
-
-目标：当 --route gns 时，自动出 4 张图（与 VIS 同款，但 D=3）：
-
-z² 直方图；2) err²–var 的散点（log–log）；3) logvar 三条线（E/N/U）；4) 逐维表导出 CSV/JSON。
-
-在你现有 analyze.py 的图代码块里，加一个 if route=='gns': 的分支（D=3）。下面是可直接贴用的核心片段（变量名按你现有的对齐即可）：
-
-import numpy as np, matplotlib.pyplot as plt, json, os
-
-# 假设 err2, var_pred, mask 已算好，形状 (N,T,D)
-D = err2.shape[-1]
-assert D in (2,3)
-names = ['E','N','U'] if D==3 else ['x','y']
-
-# 1) z^2 直方图
-z2 = (err2 / np.maximum(var_pred,1e-12))[mask]
-plt.figure(); plt.hist(z2, bins=60, density=True)
-plt.title(f'Route={args.route}  z^2 histogram'); plt.xlabel('z^2'); plt.ylabel('pdf')
-plt.tight_layout(); plt.savefig(os.path.join(args.out, 'hist_z2.png')); plt.close()
-
-# 2) err^2 vs var（per-window，log-log）
-e2v = err2[mask]; vpv = var_pred[mask]
-plt.figure(); plt.scatter(e2v, vpv, s=4, alpha=0.3)
-plt.xscale('log'); plt.yscale('log')
-plt.xlabel('err^2'); plt.ylabel('pred var'); plt.title('Scatter (per-observation, log-log)')
-plt.tight_layout(); plt.savefig(os.path.join(args.out, 'scatter_err2_vs_var_loglog.png')); plt.close()
-
-# 3) logvar 时序（逐维）
-logv = np.log(np.maximum(var_pred, 1e-30))
-t = np.arange(logv.shape[1]) # 只是索引；如有真实时间戳可替换
-plt.figure()
-for d in range(D):
-    m = mask[..., d]
-    # 取可视化一条序列（第0条），也可做均值
-    plt.plot(logv[0,:,d], label=f'logvar_{names[d]}')
-plt.legend(); plt.title('log variance (per-axis)'); plt.tight_layout()
-plt.savefig(os.path.join(args.out,'timeseries_logvar.png')); plt.close()
-
-# 4) 逐维表（JSON）
-per_axis = []
-for d, nm in enumerate(names):
-    m = mask[..., d]; z2d = (err2[..., d]/np.maximum(var_pred[..., d],1e-12))[m]
-    per_axis.append({
-        "axis": nm,
-        "Ez2": float(np.mean(z2d)),
-        "cov68": float(np.mean(z2d<=1.0)),
-        "cov95": float(np.mean(z2d<=3.841)),
-        "count": int(np.sum(m))
-    })
-with open(os.path.join(args.out, 'per_axis.json'),'w',encoding='utf-8') as f:
-    json.dump(per_axis, f, ensure_ascii=False, indent=2)
-
-5) models.py（仅当需要）：让模型不写死输出维度
-
-若你当前 Model 把输出维度写死成 2（VIS）或 3（IMU），请把最后一层线性头改成按构造参数 d_out 设置，并在 forward 里返回形状 (B,T,D) 的 mu、logvar 或你现在的输出结构。例如：
-
-class Model(nn.Module):
-    def __init__(self, d_in, d_model, d_out, n_tcn=4, kernel_size=3, n_layers_tf=1, n_heads=2, dropout=0.1):
-        super().__init__()
-        self.enc = YourTCNFront(d_in, d_model, n_tcn, kernel_size, dropout)
-        self.attn = YourTinyTransformer(d_model, n_layers_tf, n_heads, dropout) if n_layers_tf>0 else nn.Identity()
-        self.head = nn.Linear(d_model, 2*d_out)   # 输出 (mu, logvar) 各 D 维
-    def forward(self, x):
-        h = self.attn(self.enc(x))
-        out = self.head(h)           # (B,T,2D)
-        D = out.shape[-1]//2
-        mu, logv = out[..., :D], out[..., D:]
-        return mu, logv
+*** a/train.py
+--- b/train.py
+@@
+-    if args.route == "gns":
+-        # 对于GNSS，从数据集直接获取维度
+-        sample_batch = next(iter(train_dl))
+-        d_in = sample_batch["X"].shape[-1]
+-        d_out = 1                      # ← GNSS 等方差：单通道 logv
++    if args.route == "gns":
++        # 对于GNSS，从数据集直接获取维度
++        sample_batch = next(iter(train_dl))
++        d_in = sample_batch["X"].shape[-1]
++        d_out = 3                      # ← 各向异性：ENU 三通道 logvar
+@@
+-            elif args.route == "gns":
+-                # GNSS使用3维ENU损失
+-                loss = nll_iso3_e2(batch["E2"], logv, m,
+-                                   logv_min=args.logv_min, logv_max=args.logv_max)
++            elif args.route == "gns":
++                # GNSS：逐轴各向异性 NLL（E/N/U 三通道）
++                loss = nll_diag_axes(batch["E2_AXES"], logv, batch["MASK_AXES"],
++                                     logv_min=args.logv_min, logv_max=args.logv_max)
+@@
+-            if args.z2_center > 0:
++            if args.z2_center > 0:
+                 # 与 NLL 一致地 clamp，再求方差
+                 lv = torch.clamp(logv, min=args.logv_min, max=args.logv_max)
+                 v = torch.exp(lv).clamp_min(1e-12)
+-                
+-                # 根据路由确定自由度
+-                if args.route == "vis":
+-                    df = 2.0
+-                elif args.route == "gns":
+-                    df = 3.0  # ENU三维
+-                else:
+-                    df = 3.0  # IMU三维
+-                
+-                e2 = batch["E2"]
+-                m_float = m.float()
+-                
+-                # 处理维度，确保兼容性
+-                if e2.dim() == 3 and e2.shape[-1] == 1:
+-                    e2 = e2.squeeze(-1)
+-                    v = v.squeeze(-1)
+-                    m_float = m_float.squeeze(-1)
+-                
+-                z2 = (e2 / v) / df
++                # 居中目标：VIS/IMU 仍按聚合 df；GNSS（各向异性）按逐轴 z²
++                if args.route == "gns" and logv.shape[-1] == 3:
++                    e2_axes = batch["E2_AXES"]
++                    m_axes  = batch["MASK_AXES"].float()
++                    z2 = (e2_axes / v)                 # (B,T,3), 1D z²
++                    m_float = m_axes
++                else:
++                    # 原逻辑（VIS/IMU 或 GNSS 旧形态）
++                    if args.route == "vis":
++                        df = 2.0
++                    else:
++                        df = 3.0
++                    e2 = batch["E2"]
++                    m_float = m.float()
++                    if e2.dim() == 3 and e2.shape[-1] == 1:
++                        e2 = e2.squeeze(-1); v = v.squeeze(-1); m_float = m_float.squeeze(-1)
++                    z2 = (e2 / v) / df
+                 mean_z2 = (z2 * m_float).sum() / m_float.clamp_min(1.0).sum()
+@@
+-            if args.route == "vis":
+-                stats = route_metrics_vis(val_batch["E2"], logv, val_batch["MASK"], args.logv_min, args.logv_max)
+-            elif args.route == "gns":
+-                # GNSS使用IMU指标函数（都是3维）
+-                stats = route_metrics_imu(val_batch["E2"], logv, val_batch["MASK"], args.logv_min, args.logv_max)
+-            else:
++            if args.route == "vis":
++                stats = route_metrics_vis(val_batch["E2"], logv, val_batch["MASK"], args.logv_min, args.logv_max)
++            elif args.route == "gns":
++                # GNSS：逐轴指标
++                stats = route_metrics_gns_axes(val_batch["E2_AXES"], logv, val_batch["MASK_AXES"],
++                                               args.logv_min, args.logv_max)
++            else:
+                 stats = route_metrics_imu(val_batch["E2"], logv, val_batch["MASK"], args.logv_min, args.logv_max)
+@@
+-            if args.route == "vis":
+-                st = route_metrics_vis(batch["E2"], logv, batch["MASK"], args.logv_min, args.logv_max)
+-            elif args.route == "gns":
+-                st = route_metrics_imu(batch["E2"], logv, batch["MASK"], args.logv_min, args.logv_max)
+-            else:
++            if args.route == "vis":
++                st = route_metrics_vis(batch["E2"], logv, batch["MASK"], args.logv_min, args.logv_max)
++            elif args.route == "gns":
++                st = route_metrics_gns_axes(batch["E2_AXES"], logv, batch["MASK_AXES"], args.logv_min, args.logv_max)
++            else:
+                 st = route_metrics_imu(batch["E2"], logv, batch["MASK"], args.logv_min, args.logv_max)
 
 
-如果你当前是“仅预测方差”的架构，也可以只输出 logv，不影响本文其它改动。
+上面改动建立在你当前的训练脚本结构之上（动态设置 d_out，原先 GNSS 用 e2sum+各向同性 NLL）。
 
-6) config.yaml：新增 gns 的训练/评测块（不影响老的 vis）
+四、metrics.py：新增 GNSS 逐轴评测指标
 
-直接把下面块追加到你的 config.yaml（你原来的 bicycle:、vis:、train:、model: 都保留，VIS 照常用）。后续训练 GNSS 时传 --route gns 即可读取这套默认值。
+保留原 IMU/VIS 指标函数，新增一个逐轴的 GNSS 版本，用 1D 的卡方阈值（68%≈z²<=1，95%≈z²<=3.841），并统计饱和率/相关性。
 
-train_gns:
-  route: gns
-  train_npz: data_gns/train_gns.npz
-  val_npz:   data_gns/val_gns.npz
-  test_npz:  data_gns/test_gns.npz
-  run_dir:   runs/gns_tcn
-  epochs: 200
-  batch_size: 32
-  lr: 0.001
-  x_mode: both
-  seed: 0
-  logv_min: -12
-  logv_max: 5
-  z2_center: 1e-3
-  z2_center_target: 1.0
+*** a/metrics.py
+--- b/metrics.py
+@@
+ def route_metrics_vis(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
+                      logv_min: float, logv_max: float,
+                      yvar: torch.Tensor | None = None) -> dict:
+     return _route_metrics(e2sum, logv, mask, logv_min, logv_max, df=2.0, yvar=yvar)
++
++@torch.no_grad()
++def route_metrics_gns_axes(e2_axes: torch.Tensor, logv_axes: torch.Tensor, mask_axes: torch.Tensor,
++                           logv_min: float, logv_max: float) -> dict:
++    """
++    GNSS 各向异性评测：逐轴 z²，再在(B*T*D)维度整体统计。
++    """
++    lv = torch.clamp(logv_axes, min=logv_min, max=logv_max)         # (B,T,3)
++    v  = torch.clamp(torch.exp(lv), min=1e-12)
++    m  = mask_axes.float()
++    z2 = (e2_axes / v)                                              # 1D z²
++    den = torch.clamp(m.sum(), min=1.0)
++    z2_mean = float((z2 * m).sum() / den)
++    cov68   = float((((z2 <= 1.0).float() * m).sum()) / den)
++    cov95   = float((((z2 <= 3.841).float() * m).sum()) / den)
++    # 排序相关性（err² vs var）在“逐轴展开”后算
++    mask_flat = (m.reshape(-1) > 0).cpu().numpy()
++    v_np  = v.reshape(-1).detach().cpu().numpy()[mask_flat]
++    e_np  = e2_axes.reshape(-1).detach().cpu().numpy()[mask_flat]
++    if v_np.size >= 3:
++        rr = np.argsort(np.argsort(e_np))
++        vv = np.argsort(np.argsort(v_np))
++        spear = float(np.corrcoef(rr, vv)[0, 1])
++    else:
++        spear = 0.0
++    # 饱和率（对所有轴）
++    sat_min = float((((lv <= logv_min).float() * m).sum()) / den)
++    sat_max = float((((lv >= logv_max).float() * m).sum()) / den)
++    return {
++        "z2_mean": z2_mean,
++        "cov68": cov68,
++        "cov95": cov95,
++        "spear": spear,
++        "sat": sat_min + sat_max,
++        "sat_min": sat_min,
++        "sat_max": sat_max,
++        "ez2": z2_mean,
++    }
 
-model_gns:
-  d_model: 128
-  n_tcn: 10
-  kernel_size: 3
-  n_heads: 2
-  n_layers_tf: 1
-  dropout: 0.1
 
-eval_gns:
-  route: gns
-  npz: data_gns/test_gns.npz
-  model: runs/gns_tcn/best.pt
-  x_mode: both
+原有 _route_metrics 仍服务 IMU/VIS（聚合 df=2/3）。
+
+五、eval.py：GNSS 设 d_out=3，改用逐轴指标，并输出 per-axis 报告
+
+动态维度：GNSS d_out=3；
+
+批内指标：调用新函数 route_metrics_gns_axes；
+
+per-axis 报告：按 Y/MASK_AXES 与预测 logv(…,3) 计算（之前用 e2sum 与 MASK 会错位）。
+
+*** a/eval.py
+--- b/eval.py
+@@
+-    if args.route == "gns":
+-        sample_batch = next(iter(dl))
+-        d_in = sample_batch["X"].shape[-1]
+-        d_out = 1                      # ← GNSS 等方差：单通道 logv
++    if args.route == "gns":
++        sample_batch = next(iter(dl))
++        d_in = sample_batch["X"].shape[-1]
++        d_out = 3                      # ← 各向异性：ENU 三通道
+@@
+-            elif args.route == "gns":
+-                st = route_metrics_imu(batch["E2"], logv, batch["MASK"],
+-                                     logv_min=md_args.get("logv_min",-12.0),
+-                                     logv_max=md_args.get("logv_max",6.0),
+-                                     yvar=None)  # GNSS也不传yvar
++            elif args.route == "gns":
++                st = route_metrics_gns_axes(batch["E2_AXES"], logv, batch["MASK_AXES"],
++                                     logv_min=md_args.get("logv_min",-12.0),
++                                     logv_max=md_args.get("logv_max",6.0))
+@@
+-    # GNSS逐维分析
++    # GNSS逐维分析（汇总所有批次）
+     if args.route == "gns":
+         import numpy as np
+         from scipy.stats import chi2
+         
+-        # 收集所有批次数据
+-        all_err2, all_var_pred, all_mask = [], [], []
++        # 收集所有批次的逐轴数据
++        all_y_axes, all_var_axes, all_mask_axes = [], [], []
+         with torch.no_grad():
+             for batch in dl:
+                 batch = to_device(batch, args.device)
+-                logv = model(batch["X"])
+-                var = torch.exp(torch.clamp(logv, min=md_args.get("logv_min",-12.0), max=md_args.get("logv_max",6.0)))
+-                all_err2.append(batch["E2"].cpu().numpy())
+-                all_var_pred.append(var.cpu().numpy())
+-                all_mask.append(batch["MASK"].cpu().numpy())
+-        
+-        err2 = np.concatenate(all_err2, axis=0)
+-        var_pred = np.concatenate(all_var_pred, axis=0)
+-        mask = np.concatenate(all_mask, axis=0)
+-        
+-        # 逐维ENU分析
+-        D = err2.shape[-1]
+-        axis_names = ['E','N','U'] if D==3 else (['x','y'] if D==2 else [f'd{i}' for i in range(D)])
++                logv = model(batch["X"])                        # (B,T,3)
++                var  = torch.exp(torch.clamp(logv, min=md_args.get("logv_min",-12.0),
++                                              max=md_args.get("logv_max",6.0))).cpu().numpy()
++                all_y_axes.append(batch["Y"].cpu().numpy())            # (B,T,3)
++                all_var_axes.append(var)                               # (B,T,3)
++                all_mask_axes.append(batch["MASK_AXES"].cpu().numpy()) # (B,T,3)
++
++        y_axes = np.concatenate(all_y_axes, axis=0)
++        var_axes = np.concatenate(all_var_axes, axis=0)
++        mask_axes = np.concatenate(all_mask_axes, axis=0)
++
++        D = y_axes.shape[-1]
++        axis_names = ['E','N','U'] if D==3 else [f'd{i}' for i in range(D)]
+         per_axis = []
+         
+         for d in range(D):
+-            m = mask[..., d] > 0.5
+-            e2 = err2[..., d][m]
+-            vp = var_pred[..., d][m]
++            m = mask_axes[..., d] > 0.5
++            e2 = (y_axes[..., d]**2)[m]
++            vp = var_axes[..., d][m]
+             z2 = e2 / np.maximum(vp, 1e-12)
+             
+             per_axis.append({
+                 "axis": axis_names[d],
+                 "Ez2": float(np.mean(z2)),
+-                "cov68": float(np.mean(z2 <= 1.0)),  # 高斯1维: 68% ≈ z²<=1
+-                "cov95": float(np.mean(z2 <= 3.841)),  # 95% 阈值
++                "cov68": float(np.mean(z2 <= 1.0)),     # 1D: 68%
++                "cov95": float(np.mean(z2 <= 3.841)),   # 1D: 95%
+                 "count": int(e2.size)
+             })
+         
+         agg["per_axis"] = per_axis
+
+
+这一步修正了你原先 gns 的 per-axis 统计“拿不到 3 轴”的问题（之前用的是 E2 与 MASK 的 1 通道）。
+
+六、analyze.py：GNSS 可视化改为三轴
+
+把 GNSS 的 d_out 设为 3，并在作图时使用 E2_AXES/MASK_AXES，输出三条 logvar 时序和 log-log 散点。
+
+*** a/analyze.py
+--- b/analyze.py
+@@
+-    if args.route == "gns":
+-        sample_batch = next(iter(dl))
+-        d_in = sample_batch["X"].shape[-1]
+-        d_out = 1                      # ← GNSS 等方差：单通道 logv
++    if args.route == "gns":
++        sample_batch = next(iter(dl))
++        d_in = sample_batch["X"].shape[-1]
++        d_out = 3                      # ← 各向异性 ENU
+@@
+-        logv = model(batch["X"])
+-        if logv.dim() == 3 and logv.size(-1) == 1:
+-            logv = logv.squeeze(-1)
+-        var = torch.exp(logv)
+-        e2sum = batch["E2"]
+-        if e2sum.dim() == 3 and e2sum.size(-1) == 1:
+-            e2sum = e2sum.squeeze(-1)
+-        mask = batch["MASK"]
+-        if mask.dim() == 3 and mask.size(-1) == 1:
+-            mask = mask.squeeze(-1)
+-        mask = mask.float()
+-        if args.route == "vis":
++        logv = model(batch["X"])
++        if args.route == "vis":
+             df = 2.0
+-        elif args.route == "gns":
+-            df = 3.0  # ENU三维
+         else:
+             df = 3.0  # IMU三维
+-        z2 = (e2sum / var) / df
+-        mask_flat = mask > 0.5
++
++        # --- GNSS: 逐轴 ---
++        if args.route == "gns":
++            var_axes = torch.exp(logv)                      # (B,T,3)
++            e2_axes  = batch["E2_AXES"]                     # (B,T,3)
++            m_axes   = batch["MASK_AXES"].float()           # (B,T,3)
++            z2_axes  = e2_axes / torch.clamp(var_axes, 1e-12)
++            mask_flat = (m_axes > 0.5)
++            z2_np = z2_axes[mask_flat].detach().cpu().numpy().reshape(-1)
++        else:
++            if logv.dim() == 3 and logv.size(-1) == 1:
++                logv = logv.squeeze(-1)
++            var = torch.exp(logv)
++            e2sum = batch["E2"]
++            if e2sum.dim() == 3 and e2sum.size(-1) == 1:
++                e2sum = e2sum.squeeze(-1)
++            mask = batch["MASK"]
++            if mask.dim() == 3 and mask.size(-1) == 1:
++                mask = mask.squeeze(-1)
++            mask = mask.float()
++            z2 = (e2sum / var) / df
++            mask_flat = mask > 0.5
++            z2_np = z2[mask_flat].detach().cpu().numpy().reshape(-1)
+@@
+-        z2_np = z2[mask_flat].detach().cpu().numpy().reshape(-1)
+         plt.figure()
+         plt.hist(z2_np, bins=100)
+         plt.title(f"z^2 (df={int(df)}) - route={args.route}")
+@@
+-        if args.use_loglog:
++        if args.use_loglog:
+             # 对数散点图：逐窗口散点 + 对数坐标
+-            m = mask.reshape(-1, mask.shape[-1])  # (B*T, D)
+-            e2_flat = e2sum.reshape(-1, e2sum.shape[-1])  # (B*T, D)
+-            var_flat = var.reshape(-1, var.shape[-1])     # (B*T, D)
++            if args.route == "gns":
++                m = m_axes.reshape(-1, m_axes.shape[-1])      # (B*T,3)
++                e2_flat = e2_axes.reshape(-1, e2_axes.shape[-1])
++                var_flat = var_axes.reshape(-1, var_axes.shape[-1])
++            else:
++                m = mask.reshape(-1, mask.shape[-1])          # (B*T,1)
++                e2_flat = e2sum.reshape(-1, e2sum.shape[-1])
++                var_flat = var.reshape(-1, var.shape[-1])
+@@
+-            # 如果是多维，取均值聚合到标量
+-            if e2_valid.dim() > 1 and e2_valid.shape[-1] > 1:
+-                e2s = e2_valid.mean(dim=-1)
+-                vps = var_valid.mean(dim=-1)
++            # 多维（GNSS 3轴）取逐轴平均合成一个散点
++            if e2_valid.dim() > 1 and e2_valid.shape[-1] > 1:
++                e2s = e2_valid.mean(dim=-1)
++                vps = var_valid.mean(dim=-1)
+@@
+-        if args.route == "gns":
+-            # GNSS: 等方差时序图 + 逐维分析
++        if args.route == "gns":
++            # GNSS: 三轴 logvar 时序 + 逐维指标表
+             import json
+             import numpy as np
+-            
+-            # squeeze 到 2D：(B,T)
+-            if logv.dim()==3 and logv.size(-1)==1: 
+-                logv = logv.squeeze(-1)
+-            if e2sum.dim()==3 and e2sum.size(-1)==1: 
+-                e2sum = e2sum.squeeze(-1)
+-            if mask.dim()==3 and mask.size(-1)==1: 
+-                mask = mask.squeeze(-1)
+-
+-            var = torch.exp(logv).clamp_min(1e-12)      # (B,T)
+-            lv = logv.detach().cpu().numpy()
+-            
+-            # 等方差时序图（单条线）
++            lv = logv.detach().cpu().numpy()            # (B,T,3)
++
++            # 三轴 logvar（展示第一个序列）
+             plt.figure()
+-            plt.plot(lv[0], label='logvar (isotropic)')  # 只显示第一个序列
++            for d, name in enumerate(['E','N','U']):
++                plt.plot(lv[0,:,d], label=f'logvar {name}')
+             plt.legend()
+-            plt.title('log variance (isotropic ENU)')
++            plt.title('GNSS log variance (anisotropic ENU)')
+             plt.xlabel("t")
+             plt.ylabel("log(var)")
+             plt.tight_layout()
+             plt.savefig(os.path.join(args.out, "timeseries_logvar.png"))
+             plt.close()
+             
+-            # 逐维表：用逐轴误差 + 同一标量方差
+-            y_axes = batch["Y"].detach().cpu().numpy()                 # (B,T,3)
+-            m_axes = batch.get("MASK_AXES", batch["MASK"]).detach().cpu().numpy()  # (B,T,3) or (B,T,1)
+-            v_np   = var.detach().cpu().numpy()                        # (B,T)
++            # 逐维表：用逐轴误差 + 逐轴方差
++            y_axes = batch["Y"].detach().cpu().numpy()                 # (B,T,3)
++            m_axes = batch["MASK_AXES"].detach().cpu().numpy()         # (B,T,3)
++            v_np   = torch.exp(logv).detach().cpu().numpy()            # (B,T,3)
+ 
+             names = ['E','N','U']
+             per_axis = []
+             for d, nm in enumerate(names):
+-                m = (m_axes[..., d] > 0.5) if m_axes.ndim==3 else (m_axes.squeeze(-1) > 0.5)
+-                z2d = ( (y_axes[..., d]**2) / np.maximum(v_np, 1e-12) )[m]
++                m = (m_axes[..., d] > 0.5)
++                z2d = ( (y_axes[..., d]**2) / np.maximum(v_np[..., d], 1e-12) )[m]
+                 per_axis.append({
+                     "axis": nm,
+                     "Ez2": float(np.mean(z2d)),
+                     "cov68": float(np.mean(z2d <= 1.0)),
+                     "cov95": float(np.mean(z2d <= 3.841)),
+                     "count": int(m.sum())
+                 })
+
+
+原脚本在 GNSS 分支里把 logvar 当“单通道”来画，这里改成三条曲线；逐维表也改为用逐轴方差而不是同一标量方差。
+
+七、dataset.py：不需要改
+
+GNSDataset 已经输出了我们要用的 E2_AXES / MASK_AXES / Y（训练用逐轴 NLL，分析/评测做 per-axis）。
+
+运行方式（和你现在几乎一样）
+
+训练 GNSS（各向异性）：
+
+python train.py --config config.yaml --route gns \
+  --train_npz data_gns/train_gns.npz \
+  --val_npz   data_gns/val_gns.npz \
+  --test_npz  data_gns/test_gns.npz \
+  --run_dir runs/gns_aniso --epochs 20 --logv_min -12 --logv_max 6
+
+
+评测：
+
+python eval.py --route gns --npz data_gns/test_gns.npz \
+  --model runs/gns_aniso/best.pt
+
+
+输出仍有整体统计（z2_mean / cov68 / cov95 / spear / sat），并在结果里附带 per_axis（E/N/U 的覆盖/计数），且 eval.py 会正确地按逐轴计算这些。
+
+可视化：
+
+python analyze.py --route gns --npz data_gns/test_gns.npz \
+  --model runs/gns_aniso/best.pt --out viz_gns --use_loglog
+
+
+会生成三轴 logvar 时序与对数散点/直方图等图件（按逐轴 z²）。
+
+兼容性与注意点
+
+旧 checkpoint 不兼容（GNSS 从 d_out=1 → 3）。如需“部分加载”，可在你已有的加载逻辑里对最后一层用 strict=False 过滤。
+
+z² 居中（--z2_center）现在对 GNSS 是逐轴的 1D z²；对 IMU/VIS 仍沿用原来 df=3/2 的聚合版本。
+
+其他路由（acc/gyr/vis）完全不受影响。

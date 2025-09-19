@@ -44,3 +44,19 @@ def mse_anchor_1d(logv: torch.Tensor, y_var: torch.Tensor, mask: torch.Tensor, l
     m = mask.float()
     se = (logv - y)**2 * m
     return lam * se.sum() / torch.clamp(m.sum(), min=1.0)
+
+def nll_diag_axes(e2_axes: torch.Tensor, logv_axes: torch.Tensor, mask_axes: torch.Tensor,
+                  logv_min: float=-16.0, logv_max: float=6.0) -> torch.Tensor:
+    """
+    各向异性对角高斯 NLL（逐轴）。适用于 GNSS ENU 三轴。
+    e2_axes  : (B,T,3)   每轴误差平方
+    logv_axes: (B,T,3)   每轴 log(σ^2)
+    mask_axes: (B,T,3)   每轴有效掩码
+    """
+    lv = torch.clamp(logv_axes, min=logv_min, max=logv_max)
+    inv_v = torch.exp(-lv)                 # (B,T,3)
+    nll = 0.5 * (e2_axes * inv_v + lv)    # (B,T,3)
+    m = mask_axes.float()
+    num = (nll * m).sum()
+    den = torch.clamp(m.sum(), min=1.0)
+    return num / den

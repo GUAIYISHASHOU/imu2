@@ -106,3 +106,41 @@ def route_metrics_vis(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tenso
                      logv_min: float, logv_max: float,
                      yvar: torch.Tensor | None = None) -> dict:
     return _route_metrics(e2sum, logv, mask, logv_min, logv_max, df=2.0, yvar=yvar)
+
+@torch.no_grad()
+def route_metrics_gns_axes(e2_axes: torch.Tensor, logv_axes: torch.Tensor, mask_axes: torch.Tensor,
+                           logv_min: float, logv_max: float) -> dict:
+    """
+    GNSS 各向异性评测：逐轴 z²，再在(B*T*D)维度整体统计。
+    """
+    lv = torch.clamp(logv_axes, min=logv_min, max=logv_max)         # (B,T,3)
+    v  = torch.clamp(torch.exp(lv), min=1e-12)
+    m  = mask_axes.float()
+    z2 = (e2_axes / v)                                              # 1D z²
+    den = torch.clamp(m.sum(), min=1.0)
+    z2_mean = float((z2 * m).sum() / den)
+    cov68   = float((((z2 <= 1.0).float() * m).sum()) / den)
+    cov95   = float((((z2 <= 3.841).float() * m).sum()) / den)
+    # 排序相关性（err² vs var）在"逐轴展开"后算
+    mask_flat = (m.reshape(-1) > 0).cpu().numpy()
+    v_np  = v.reshape(-1).detach().cpu().numpy()[mask_flat]
+    e_np  = e2_axes.reshape(-1).detach().cpu().numpy()[mask_flat]
+    if v_np.size >= 3:
+        rr = np.argsort(np.argsort(e_np))
+        vv = np.argsort(np.argsort(v_np))
+        spear = float(np.corrcoef(rr, vv)[0, 1])
+    else:
+        spear = 0.0
+    # 饱和率（对所有轴）
+    sat_min = float((((lv <= logv_min).float() * m).sum()) / den)
+    sat_max = float((((lv >= logv_max).float() * m).sum()) / den)
+    return {
+        "z2_mean": z2_mean,
+        "cov68": cov68,
+        "cov95": cov95,
+        "spear": spear,
+        "sat": sat_min + sat_max,
+        "sat_min": sat_min,
+        "sat_max": sat_max,
+        "ez2": z2_mean,
+    }

@@ -5,7 +5,7 @@ import torch
 from utils import to_device, load_config_file
 from dataset import build_loader
 from models import IMURouteModel
-from metrics import route_metrics_imu, route_metrics_vis
+from metrics import route_metrics_imu, route_metrics_vis, route_metrics_gns_axes
 
 def parse_args():
     pre = argparse.ArgumentParser(add_help=False)
@@ -38,7 +38,7 @@ def main():
     if args.route == "gns":
         sample_batch = next(iter(dl))
         d_in = sample_batch["X"].shape[-1]
-        d_out = 1                      # ← GNSS 等方差：单通道 logv
+        d_out = 3                      # ← 各向异性：ENU 三通道
     elif args.route == "vis":
         d_in = ds.X_all.shape[-1]
         d_out = 1
@@ -70,10 +70,9 @@ def main():
                                      logv_max=md_args.get("logv_max",6.0),
                                      yvar=None)  # VIS路由不传yvar，避免异常指标
             elif args.route == "gns":
-                st = route_metrics_imu(batch["E2"], logv, batch["MASK"],
+                st = route_metrics_gns_axes(batch["E2_AXES"], logv, batch["MASK_AXES"],
                                      logv_min=md_args.get("logv_min",-12.0),
-                                     logv_max=md_args.get("logv_max",6.0),
-                                     yvar=None)  # GNSS也不传yvar
+                                     logv_max=md_args.get("logv_max",6.0))
             else:
                 st = route_metrics_imu(batch["E2"], logv, batch["MASK"],
                                      logv_min=md_args.get("logv_min",-12.0),
@@ -85,42 +84,42 @@ def main():
     keys = all_stats[0].keys()
     agg = {k: float(sum(d[k] for d in all_stats)/len(all_stats)) for k in keys}
     
-    # GNSS逐维分析
+    # GNSS逐维分析（汇总所有批次）
     if args.route == "gns":
         import numpy as np
         from scipy.stats import chi2
         
-        # 收集所有批次数据
-        all_err2, all_var_pred, all_mask = [], [], []
+        # 收集所有批次的逐轴数据
+        all_y_axes, all_var_axes, all_mask_axes = [], [], []
         with torch.no_grad():
             for batch in dl:
                 batch = to_device(batch, args.device)
-                logv = model(batch["X"])
-                var = torch.exp(torch.clamp(logv, min=md_args.get("logv_min",-12.0), max=md_args.get("logv_max",6.0)))
-                all_err2.append(batch["E2"].cpu().numpy())
-                all_var_pred.append(var.cpu().numpy())
-                all_mask.append(batch["MASK"].cpu().numpy())
-        
-        err2 = np.concatenate(all_err2, axis=0)
-        var_pred = np.concatenate(all_var_pred, axis=0)
-        mask = np.concatenate(all_mask, axis=0)
-        
-        # 逐维ENU分析
-        D = err2.shape[-1]
-        axis_names = ['E','N','U'] if D==3 else (['x','y'] if D==2 else [f'd{i}' for i in range(D)])
+                logv = model(batch["X"])                        # (B,T,3)
+                var  = torch.exp(torch.clamp(logv, min=md_args.get("logv_min",-12.0),
+                                              max=md_args.get("logv_max",6.0))).cpu().numpy()
+                all_y_axes.append(batch["Y"].cpu().numpy())            # (B,T,3)
+                all_var_axes.append(var)                               # (B,T,3)
+                all_mask_axes.append(batch["MASK_AXES"].cpu().numpy()) # (B,T,3)
+
+        y_axes = np.concatenate(all_y_axes, axis=0)
+        var_axes = np.concatenate(all_var_axes, axis=0)
+        mask_axes = np.concatenate(all_mask_axes, axis=0)
+
+        D = y_axes.shape[-1]
+        axis_names = ['E','N','U'] if D==3 else [f'd{i}' for i in range(D)]
         per_axis = []
         
         for d in range(D):
-            m = mask[..., d] > 0.5
-            e2 = err2[..., d][m]
-            vp = var_pred[..., d][m]
+            m = mask_axes[..., d] > 0.5
+            e2 = (y_axes[..., d]**2)[m]
+            vp = var_axes[..., d][m]
             z2 = e2 / np.maximum(vp, 1e-12)
             
             per_axis.append({
                 "axis": axis_names[d],
                 "Ez2": float(np.mean(z2)),
-                "cov68": float(np.mean(z2 <= 1.0)),  # 高斯1维: 68% ≈ z²<=1
-                "cov95": float(np.mean(z2 <= 3.841)),  # 95% 阈值
+                "cov68": float(np.mean(z2 <= 1.0)),     # 1D: 68%
+                "cov95": float(np.mean(z2 <= 3.841)),   # 1D: 95%
                 "count": int(e2.size)
             })
         

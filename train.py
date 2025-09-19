@@ -8,8 +8,8 @@ from torch.optim import AdamW
 from utils import seed_everything, to_device, count_params, load_config_file
 from dataset import build_loader
 from models import IMURouteModel
-from losses import nll_iso3_e2, nll_iso2_e2, mse_anchor_1d
-from metrics import route_metrics_imu, route_metrics_vis
+from losses import nll_iso3_e2, nll_iso2_e2, mse_anchor_1d, nll_diag_axes
+from metrics import route_metrics_imu, route_metrics_vis, route_metrics_gns_axes
 
 def parse_args():
     pre = argparse.ArgumentParser(add_help=False)
@@ -75,7 +75,7 @@ def main():
         # 对于GNSS，从数据集直接获取维度
         sample_batch = next(iter(train_dl))
         d_in = sample_batch["X"].shape[-1]
-        d_out = 1                      # ← GNSS 等方差：单通道 logv
+        d_out = 3                      # ← 各向异性：ENU 三通道 logvar
     elif args.route == "vis":
         d_in = train_ds.X_all.shape[-1]
         d_out = 1  # VIS: 1维聚合误差
@@ -104,9 +104,9 @@ def main():
                 loss = nll_iso2_e2(batch["E2"], logv, m,
                                    logv_min=args.logv_min, logv_max=args.logv_max)
             elif args.route == "gns":
-                # GNSS使用3维ENU损失
-                loss = nll_iso3_e2(batch["E2"], logv, m,
-                                   logv_min=args.logv_min, logv_max=args.logv_max)
+                # GNSS：逐轴各向异性 NLL（E/N/U 三通道）
+                loss = nll_diag_axes(batch["E2_AXES"], logv, batch["MASK_AXES"],
+                                     logv_min=args.logv_min, logv_max=args.logv_max)
             else:
                 # IMU (acc/gyr)
                 loss = nll_iso3_e2(batch["E2"], logv, m,
@@ -120,24 +120,23 @@ def main():
                 lv = torch.clamp(logv, min=args.logv_min, max=args.logv_max)
                 v = torch.exp(lv).clamp_min(1e-12)
                 
-                # 根据路由确定自由度
-                if args.route == "vis":
-                    df = 2.0
-                elif args.route == "gns":
-                    df = 3.0  # ENU三维
+                # 居中目标：VIS/IMU 仍按聚合 df；GNSS（各向异性）按逐轴 z²
+                if args.route == "gns" and logv.shape[-1] == 3:
+                    e2_axes = batch["E2_AXES"]
+                    m_axes  = batch["MASK_AXES"].float()
+                    z2 = (e2_axes / v)                 # (B,T,3), 1D z²
+                    m_float = m_axes
                 else:
-                    df = 3.0  # IMU三维
-                
-                e2 = batch["E2"]
-                m_float = m.float()
-                
-                # 处理维度，确保兼容性
-                if e2.dim() == 3 and e2.shape[-1] == 1:
-                    e2 = e2.squeeze(-1)
-                    v = v.squeeze(-1)
-                    m_float = m_float.squeeze(-1)
-                
-                z2 = (e2 / v) / df
+                    # 原逻辑（VIS/IMU 或 GNSS 旧形态）
+                    if args.route == "vis":
+                        df = 2.0
+                    else:
+                        df = 3.0
+                    e2 = batch["E2"]
+                    m_float = m.float()
+                    if e2.dim() == 3 and e2.shape[-1] == 1:
+                        e2 = e2.squeeze(-1); v = v.squeeze(-1); m_float = m_float.squeeze(-1)
+                    z2 = (e2 / v) / df
                 mean_z2 = (z2 * m_float).sum() / m_float.clamp_min(1.0).sum()
                 
                 # 目标值：高斯=1；若是 Student-t 则 nu/(nu-2)
@@ -170,8 +169,9 @@ def main():
             if args.route == "vis":
                 stats = route_metrics_vis(val_batch["E2"], logv, val_batch["MASK"], args.logv_min, args.logv_max)
             elif args.route == "gns":
-                # GNSS使用IMU指标函数（都是3维）
-                stats = route_metrics_imu(val_batch["E2"], logv, val_batch["MASK"], args.logv_min, args.logv_max)
+                # GNSS：逐轴指标
+                stats = route_metrics_gns_axes(val_batch["E2_AXES"], logv, val_batch["MASK_AXES"],
+                                               args.logv_min, args.logv_max)
             else:
                 stats = route_metrics_imu(val_batch["E2"], logv, val_batch["MASK"], args.logv_min, args.logv_max)
 
@@ -202,7 +202,7 @@ def main():
             if args.route == "vis":
                 st = route_metrics_vis(batch["E2"], logv, batch["MASK"], args.logv_min, args.logv_max)
             elif args.route == "gns":
-                st = route_metrics_imu(batch["E2"], logv, batch["MASK"], args.logv_min, args.logv_max)
+                st = route_metrics_gns_axes(batch["E2_AXES"], logv, batch["MASK_AXES"], args.logv_min, args.logv_max)
             else:
                 st = route_metrics_imu(batch["E2"], logv, batch["MASK"], args.logv_min, args.logv_max)
             if agg is None: 
