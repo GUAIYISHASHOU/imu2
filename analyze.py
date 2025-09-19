@@ -16,6 +16,7 @@ def parse_args():
     ap.add_argument("--x_mode", choices=["both","route_only"], default="both")
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--use_loglog", action="store_true", help="使用对数坐标散点图（推荐）")
     return ap.parse_args()
 
 def main():
@@ -69,16 +70,49 @@ def main():
         plt.close()
 
         # Plot 2: scatter err^2 vs var
-        es = e2sum[mask_flat].detach().cpu().numpy().reshape(-1)
-        vv = var[mask_flat].detach().cpu().numpy().reshape(-1)
-        plt.figure()
-        plt.scatter(es, vv, s=4, alpha=0.5)
-        plt.xlabel("pooled err^2")
-        plt.ylabel("pred var")
-        plt.title(f"Scatter pooled err^2 vs var - route={args.route}")
-        plt.tight_layout()
-        plt.savefig(os.path.join(args.out, "scatter_err2_vs_var.png"))
-        plt.close()
+        if args.use_loglog:
+            # 对数散点图：逐窗口散点 + 对数坐标
+            m = mask.reshape(-1, mask.shape[-1])  # (B*T, D)
+            e2_flat = e2sum.reshape(-1, e2sum.shape[-1])  # (B*T, D)
+            var_flat = var.reshape(-1, var.shape[-1])     # (B*T, D)
+            
+            # 应用mask过滤
+            valid_mask = m > 0.5
+            e2_valid = e2_flat[valid_mask]
+            var_valid = var_flat[valid_mask]
+            
+            # 如果是多维，取均值聚合到标量
+            if e2_valid.dim() > 1 and e2_valid.shape[-1] > 1:
+                e2s = e2_valid.mean(dim=-1)
+                vps = var_valid.mean(dim=-1)
+            else:
+                e2s = e2_valid.squeeze(-1) if e2_valid.dim() > 1 else e2_valid
+                vps = var_valid.squeeze(-1) if var_valid.dim() > 1 else var_valid
+            
+            e2s_np = e2s.detach().cpu().numpy()
+            vps_np = vps.detach().cpu().numpy()
+            
+            plt.figure()
+            plt.scatter(e2s_np, vps_np, s=6, alpha=0.35)
+            plt.xscale('log'); plt.yscale('log')  # 关键：对数坐标
+            plt.xlabel('err^2 (per-window, pooled)')
+            plt.ylabel('pred var')
+            plt.title(f'Scatter (per-window, log-log) - route={args.route}')
+            plt.tight_layout()
+            plt.savefig(os.path.join(args.out, "scatter_err2_vs_var_loglog.png"))
+            plt.close()
+        else:
+            # 原始散点图
+            es = e2sum[mask_flat].detach().cpu().numpy().reshape(-1)
+            vv = var[mask_flat].detach().cpu().numpy().reshape(-1)
+            plt.figure()
+            plt.scatter(es, vv, s=4, alpha=0.5)
+            plt.xlabel("pooled err^2")
+            plt.ylabel("pred var")
+            plt.title(f"Scatter pooled err^2 vs var - route={args.route}")
+            plt.tight_layout()
+            plt.savefig(os.path.join(args.out, "scatter_err2_vs_var.png"))
+            plt.close()
 
         # Plot 3: time series of logvar (first few sequences)
         lv = logv.detach().cpu().numpy()
