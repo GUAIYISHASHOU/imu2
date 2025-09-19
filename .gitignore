@@ -3,3 +3,5 @@ data_cache/
 runs/
 data_vis/
 __pycache__/
+trajectory_plots/
+data_gns/
