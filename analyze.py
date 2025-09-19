@@ -60,7 +60,9 @@ def main():
 
         # --- GNSS: 逐轴 ---
         if args.route == "gns":
-            var_axes = torch.exp(logv)                      # (B,T,3)
+            # 与eval.py保持一致的clamp范围
+            logv_clamped = torch.clamp(logv, min=-12.0, max=6.0)
+            var_axes = torch.exp(logv_clamped)              # (B,T,3)
             e2_axes  = batch["E2_AXES"]                     # (B,T,3)
             m_axes   = batch["MASK_AXES"].float()           # (B,T,3)
             z2_axes  = e2_axes / torch.clamp(var_axes, 1e-12)
@@ -69,7 +71,9 @@ def main():
         else:
             if logv.dim() == 3 and logv.size(-1) == 1:
                 logv = logv.squeeze(-1)
-            var = torch.exp(logv)
+            # 与eval.py保持一致的clamp范围
+            logv_clamped = torch.clamp(logv, min=-12.0, max=6.0)
+            var = torch.exp(logv_clamped)
             e2sum = batch["E2"]
             if e2sum.dim() == 3 and e2sum.size(-1) == 1:
                 e2sum = e2sum.squeeze(-1)
@@ -82,9 +86,11 @@ def main():
             z2_np = z2[mask_flat].detach().cpu().numpy().reshape(-1)
 
         # Plot 1: histogram of z^2
+        # GNSS使用逐轴1D z²，显示df=1；其他路由按原df
+        hist_df = 1 if args.route == "gns" else int(df)
         plt.figure()
         plt.hist(z2_np, bins=100)
-        plt.title(f"z^2 (df={int(df)}) - route={args.route}")
+        plt.title(f"z^2 (df={hist_df}) - route={args.route}")
         plt.xlabel("z^2")
         plt.ylabel("count")
         plt.tight_layout()
@@ -130,8 +136,15 @@ def main():
             plt.close()
         else:
             # 原始散点图
-            es = e2sum[mask_flat].detach().cpu().numpy().reshape(-1)
-            vv = var[mask_flat].detach().cpu().numpy().reshape(-1)
+            if args.route == "gns":
+                # GNSS: 使用逐轴数据，取平均聚合
+                es = e2_axes[mask_flat].mean(dim=-1).detach().cpu().numpy().reshape(-1)
+                vv = var_axes[mask_flat].mean(dim=-1).detach().cpu().numpy().reshape(-1)
+            else:
+                # 其他路由：使用聚合数据
+                es = e2sum[mask_flat].detach().cpu().numpy().reshape(-1)
+                vv = var[mask_flat].detach().cpu().numpy().reshape(-1)
+                
             plt.figure()
             plt.scatter(es, vv, s=4, alpha=0.5)
             plt.xlabel("pooled err^2")
@@ -146,7 +159,7 @@ def main():
             # GNSS: 三轴 logvar 时序 + 逐维指标表
             import json
             import numpy as np
-            lv = logv.detach().cpu().numpy()            # (B,T,3)
+            lv = logv_clamped.detach().cpu().numpy()    # (B,T,3) 使用clamped版本
 
             # 三轴 logvar（展示第一个序列）
             plt.figure()
@@ -163,7 +176,7 @@ def main():
             # 逐维表：用逐轴误差 + 逐轴方差
             y_axes = batch["Y"].detach().cpu().numpy()                 # (B,T,3)
             m_axes = batch["MASK_AXES"].detach().cpu().numpy()         # (B,T,3)
-            v_np   = torch.exp(logv).detach().cpu().numpy()            # (B,T,3)
+            v_np   = var_axes.detach().cpu().numpy()                   # (B,T,3) 使用clamped版本
 
             names = ['E','N','U']
             per_axis = []
@@ -182,7 +195,7 @@ def main():
                 json.dump(per_axis, f, ensure_ascii=False, indent=2)
         else:
             # 原始时序图
-            lv = logv.detach().cpu().numpy()
+            lv = logv_clamped.detach().cpu().numpy()  # 使用clamped版本
             T = lv.shape[1]
             K = min(4, lv.shape[0])
             plt.figure()
