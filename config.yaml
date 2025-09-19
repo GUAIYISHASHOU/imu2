@@ -1,98 +1,75 @@
-# Unified configuration for data generation, training, and evaluation
-
-# IMU-only generator (gen_bicycle_dual.py)
-bicycle:
-  out: data_cache
+# —— 一次性生成 IMU+VIS+GNSS 的多模态生成器（gen_bicycle_multi.py）
+multi:
   seed: 42
-  traj_duration_s: 500
-  rate_hz: 100
-  # 用作 acc/gyr 的默认窗口；若想分开，可再加 acc_window_size/gyr_window_size 覆盖
-  window_size: 256
-  window_stride: 128
-  train_routes: 6
-  val_routes: 2
-  test_routes: 2
-  # Kinematic bicycle physics
-  wheelbase: 2.7
-  rear_ratio: 0.55
-  use_slip: true
-  use_gravity: true
-  use_roll_pitch: true
-  bank_gain: 1.0
-  pitch_gain: 1.0
-  # Output control
-  no_combined: false
-  timestamp_out: false   # ✅ 关键：关闭时间戳目录，路径与 train_npz 对齐
-  no_split_routes: false
-
-# Visual+IMU generator (gen_bicycle_dual_vis.py)
-vis:
-  out: data_vis
-  seed: 42
-  traj_duration_s: 500
+  traj_duration_s: 2000
   rate_hz: 100
   train_routes: 6
   val_routes: 2
   test_routes: 2
-  cam_rate_hz: 10
-  img_w: 640
-  img_h: 480
-  fx: 400.0
-  fy: 400.0
-  cx: 320.0
-  cy: 240.0
+  # 严格共轨迹的握手文件（可选）
+  save_routes_meta: data_cache/routes_meta.json   # 生成时保存
+  routes_meta: null                               # 复现时读取
+
+  # 输出目录
+  imu_out: data_cache
+  vis_out: data_vis
+  gns_out: data_gns
+
+  # IMU（100 Hz）
+  imu_window: 256
+  imu_stride: 128
+
+  # VIS（10 Hz）
   vis_window: 32
   vis_stride: 16
-  # —— 视觉噪声/难度参数（保持你现在的设置）——
   noise_px: 0.35
-  noise_tau_s: 0.4
-  noise_ln_std: 0.35
   outlier_ratio: 0.05
-  out_tau_s: 0.6
-  burst_prob: 0.03
-  burst_gain: [0.2, 0.6]
-  motion_k1: 0.8
-  motion_k2: 0.4
-  lp_pool_p: 3.0
-  min_match: 8
 
-# Training configuration (train.py)
-train:
-  route: vis
-  train_npz: data_vis/train_vis.npz
-  val_npz:   data_vis/val_vis.npz
-  test_npz:  data_vis/test_vis.npz
-  run_dir: runs/vis
-  epochs: 300
+  # GNSS（1 Hz）
+  gns_win: 50
+  gns_stride: 25
+  gns_arch_enable: true
+  base_sigma_en: [0.7, 0.7]
+  base_sigma_u: 1.8
+  scene_bounds: [400, 400, 400, 400, 400]
+  scene_gain_en: [1.0, 2.5, 4.0, 1.5, 1.0]
+  scene_gain_u:  [1.8, 3.5, 5.0, 2.0, 1.8]
+  omega: 0.05
+  alpha: 0.35
+  beta: 0.45
+  p_out: 0.03
+  t_df: 3.0
+  vendor_bias: 1.4
+  vendor_ln_jitter: 0.2
+
+# —— GNSS 训练/评测（route=gns）
+train_gns:
+  route: gns
+  train_npz: data_gns/train_gns.npz
+  val_npz:   data_gns/val_gns.npz
+  test_npz:  data_gns/test_gns.npz
+  run_dir:   runs/gns_tcn
+  epochs: 200
   batch_size: 32
   lr: 0.001
   x_mode: both
   seed: 0
-  # —— 标度与边界（按我们刚才的结论）——
-  logv_min: -14
-  logv_max: 4.5
-  # 轻正则：把 z² 从 ~0.91 拉回目标（高斯=1；Student-t 自动算 nu/(nu-2)）
+  # 建议的方差头边界与校准
+  logv_min: -12
+  logv_max: 5
   z2_center: 1e-3
-  z2_center_target: auto
-  # 若你在 IMU 路由也训练，可考虑：
-  # anchor_weight: 0.002  # IMU 路由用作尺度锚；VIS 路由可不设
-  # early_patience: 10
+  z2_center_target: 1.0   # GNSS 用高斯目标=1
 
-# Model architecture
-model:
+model_gns:
   d_model: 128
-  n_tcn: 4
+  n_tcn: 10           # 空洞卷积感受野≈34 min（1 Hz）
   kernel_size: 3
-  n_heads: 4
-  n_layers_tf: 2
+  n_heads: 2
+  n_layers_tf: 1      # 一层小注意力足够
   dropout: 0.1
 
-runtime:
-  num_workers: 0
-  device: cuda
-
-eval:
-  route: vis
-  npz: data_vis/test_vis.npz
-  model: runs/vis/best.pt
+eval_gns:
+  route: gns
+  npz: data_gns/test_gns.npz
+  model: runs/gns_tcn/best.pt
   x_mode: both
