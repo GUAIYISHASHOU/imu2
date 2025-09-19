@@ -17,6 +17,7 @@ from __future__ import annotations
 import os, json, math, argparse, random
 from pathlib import Path
 import numpy as np
+from utils import load_config_file
 
 # ----------------- 小工具 -----------------
 def set_seed(seed: int):
@@ -167,50 +168,59 @@ def build_gns_features(tr_1hz, vendor):
 
 # ----------------- 主流程 -----------------
 def main():
-    ap = argparse.ArgumentParser()
+    # 先解析配置文件参数
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=str, default=None, help="YAML/JSON 配置文件")
+    args_pre, _ = pre.parse_known_args()
+    
+    # 加载配置
+    cfg = load_config_file(args_pre.config) if args_pre.config else {}
+    multi = cfg.get("multi", {})
+    
+    ap = argparse.ArgumentParser("Generate IMU+VIS+GNSS multi-modal data", parents=[pre])
     # 轨迹/split
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--traj_duration_s", type=int, default=2000)
-    ap.add_argument("--rate_hz", type=int, default=100)
-    ap.add_argument("--train_routes", type=int, default=6)
-    ap.add_argument("--val_routes", type=int, default=2)
-    ap.add_argument("--test_routes", type=int, default=2)
+    ap.add_argument("--seed", type=int, default=multi.get("seed", 42))
+    ap.add_argument("--traj_duration_s", type=int, default=multi.get("traj_duration_s", 2000))
+    ap.add_argument("--rate_hz", type=int, default=multi.get("rate_hz", 100))
+    ap.add_argument("--train_routes", type=int, default=multi.get("train_routes", 6))
+    ap.add_argument("--val_routes", type=int, default=multi.get("val_routes", 2))
+    ap.add_argument("--test_routes", type=int, default=multi.get("test_routes", 2))
 
     # 输出目录
-    ap.add_argument("--imu_out", default="data_cache")
-    ap.add_argument("--vis_out", default="data_vis")
-    ap.add_argument("--gns_out", default="data_gns")
+    ap.add_argument("--imu_out", default=multi.get("imu_out", "data_cache"))
+    ap.add_argument("--vis_out", default=multi.get("vis_out", "data_vis"))
+    ap.add_argument("--gns_out", default=multi.get("gns_out", "data_gns"))
 
     # IMU 窗口
-    ap.add_argument("--imu_window", type=int, default=256)
-    ap.add_argument("--imu_stride", type=int, default=128)
+    ap.add_argument("--imu_window", type=int, default=multi.get("imu_window", 256))
+    ap.add_argument("--imu_stride", type=int, default=multi.get("imu_stride", 128))
 
-    # VIS 窗口与像素噪声（如果你已有实现，运行时这些参数不起决定作用）
-    ap.add_argument("--vis_window", type=int, default=32)
-    ap.add_argument("--vis_stride", type=int, default=16)
-    ap.add_argument("--noise_px", type=float, default=0.35)
-    ap.add_argument("--outlier_ratio", type=float, default=0.05)
+    # VIS 窗口与像素噪声
+    ap.add_argument("--vis_window", type=int, default=multi.get("vis_window", 32))
+    ap.add_argument("--vis_stride", type=int, default=multi.get("vis_stride", 16))
+    ap.add_argument("--noise_px", type=float, default=multi.get("noise_px", 0.35))
+    ap.add_argument("--outlier_ratio", type=float, default=multi.get("outlier_ratio", 0.05))
 
     # GNSS 配置
-    ap.add_argument("--gns_win", type=int, default=50)
-    ap.add_argument("--gns_stride", type=int, default=25)
-    ap.add_argument("--gns_arch_enable", action="store_true")
-    ap.add_argument("--base_sigma_en", type=float, nargs=2, default=(0.7,0.7))
-    ap.add_argument("--base_sigma_u", type=float, default=1.8)
-    ap.add_argument("--scene_bounds", type=int, nargs="+", default=[400,400,400,400,400])
-    ap.add_argument("--scene_gain_en", type=float, nargs="+", default=[1.0,2.5,4.0,1.5,1.0])
-    ap.add_argument("--scene_gain_u",  type=float, nargs="+", default=[1.8,3.5,5.0,2.0,1.8])
-    ap.add_argument("--omega", type=float, default=0.05)
-    ap.add_argument("--alpha", type=float, default=0.35)
-    ap.add_argument("--beta",  type=float, default=0.45)
-    ap.add_argument("--p_out", type=float, default=0.03)
-    ap.add_argument("--t_df", type=float, default=3.0)
-    ap.add_argument("--vendor_bias", type=float, default=1.4)
-    ap.add_argument("--vendor_ln_jitter", type=float, default=0.2)
+    ap.add_argument("--gns_win", type=int, default=multi.get("gns_win", 50))
+    ap.add_argument("--gns_stride", type=int, default=multi.get("gns_stride", 25))
+    ap.add_argument("--gns_arch_enable", action="store_true", default=multi.get("gns_arch_enable", False))
+    ap.add_argument("--base_sigma_en", type=float, nargs=2, default=multi.get("base_sigma_en", [0.7,0.7]))
+    ap.add_argument("--base_sigma_u", type=float, default=multi.get("base_sigma_u", 1.8))
+    ap.add_argument("--scene_bounds", type=int, nargs="+", default=multi.get("scene_bounds", [400,400,400,400,400]))
+    ap.add_argument("--scene_gain_en", type=float, nargs="+", default=multi.get("scene_gain_en", [1.0,2.5,4.0,1.5,1.0]))
+    ap.add_argument("--scene_gain_u",  type=float, nargs="+", default=multi.get("scene_gain_u", [1.8,3.5,5.0,2.0,1.8]))
+    ap.add_argument("--omega", type=float, default=multi.get("omega", 0.05))
+    ap.add_argument("--alpha", type=float, default=multi.get("alpha", 0.35))
+    ap.add_argument("--beta",  type=float, default=multi.get("beta", 0.45))
+    ap.add_argument("--p_out", type=float, default=multi.get("p_out", 0.03))
+    ap.add_argument("--t_df", type=float, default=multi.get("t_df", 3.0))
+    ap.add_argument("--vendor_bias", type=float, default=multi.get("vendor_bias", 1.4))
+    ap.add_argument("--vendor_ln_jitter", type=float, default=multi.get("vendor_ln_jitter", 0.2))
 
     # 严格共轨迹
-    ap.add_argument("--save_routes_meta", default=None)
-    ap.add_argument("--routes_meta", default=None)
+    ap.add_argument("--save_routes_meta", default=multi.get("save_routes_meta", None))
+    ap.add_argument("--routes_meta", default=multi.get("routes_meta", None))
     args = ap.parse_args()
 
     ensure_dir(args.imu_out); ensure_dir(args.vis_out); ensure_dir(args.gns_out)
