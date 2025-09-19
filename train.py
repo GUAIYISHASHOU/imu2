@@ -75,7 +75,7 @@ def main():
         # 对于GNSS，从数据集直接获取维度
         sample_batch = next(iter(train_dl))
         d_in = sample_batch["X"].shape[-1]
-        d_out = sample_batch["E2"].shape[-1]  # GNS: 3维 (ENU)
+        d_out = 1                      # ← GNSS 等方差：单通道 logv
     elif args.route == "vis":
         d_in = train_ds.X_all.shape[-1]
         d_out = 1  # VIS: 1维聚合误差

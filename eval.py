@@ -38,7 +38,7 @@ def main():
     if args.route == "gns":
         sample_batch = next(iter(dl))
         d_in = sample_batch["X"].shape[-1]
-        d_out = sample_batch["E2"].shape[-1]
+        d_out = 1                      # ← GNSS 等方差：单通道 logv
     elif args.route == "vis":
         d_in = ds.X_all.shape[-1]
         d_out = 1

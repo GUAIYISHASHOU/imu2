@@ -28,7 +28,7 @@ def main():
     if args.route == "gns":
         sample_batch = next(iter(dl))
         d_in = sample_batch["X"].shape[-1]
-        d_out = sample_batch["E2"].shape[-1]
+        d_out = 1                      # ← GNSS 等方差：单通道 logv
     elif args.route == "vis":
         d_in = ds.X_all.shape[-1]
         d_out = 1
@@ -130,43 +130,48 @@ def main():
 
         # Plot 3: time series of logvar (first few sequences)
         if args.route == "gns":
-            # GNSS: 逐维时序图
+            # GNSS: 等方差时序图 + 逐维分析
+            import json
+            import numpy as np
+            
+            # squeeze 到 2D：(B,T)
+            if logv.dim()==3 and logv.size(-1)==1: 
+                logv = logv.squeeze(-1)
+            if e2sum.dim()==3 and e2sum.size(-1)==1: 
+                e2sum = e2sum.squeeze(-1)
+            if mask.dim()==3 and mask.size(-1)==1: 
+                mask = mask.squeeze(-1)
+
+            var = torch.exp(logv).clamp_min(1e-12)      # (B,T)
             lv = logv.detach().cpu().numpy()
-            D = lv.shape[-1]
-            names = ['E','N','U'] if D==3 else (['x','y'] if D==2 else [f'd{i}' for i in range(D)])
+            
+            # 等方差时序图（单条线）
             plt.figure()
-            for d in range(D):
-                plt.plot(lv[0,:,d], label=f'logvar_{names[d]}')  # 只显示第一个序列
+            plt.plot(lv[0], label='logvar (isotropic)')  # 只显示第一个序列
             plt.legend()
-            plt.title('log variance (per-axis)')
+            plt.title('log variance (isotropic ENU)')
             plt.xlabel("t")
             plt.ylabel("log(var)")
             plt.tight_layout()
             plt.savefig(os.path.join(args.out, "timeseries_logvar.png"))
             plt.close()
             
-            # 逐维表（JSON）
-            import json
-            import numpy as np
-            e2_np = e2sum.detach().cpu().numpy()
-            var_np = var.detach().cpu().numpy()
-            mask_np = mask.detach().cpu().numpy()
-            
+            # 逐维表：用逐轴误差 + 同一标量方差
+            y_axes = batch["Y"].detach().cpu().numpy()                 # (B,T,3)
+            m_axes = batch.get("MASK_AXES", batch["MASK"]).detach().cpu().numpy()  # (B,T,3) or (B,T,1)
+            v_np   = var.detach().cpu().numpy()                        # (B,T)
+
+            names = ['E','N','U']
             per_axis = []
             for d, nm in enumerate(names):
-                if D > 1:
-                    m = mask_np[..., d] > 0.5
-                    z2d = (e2_np[..., d]/np.maximum(var_np[..., d], 1e-12))[m]
-                else:
-                    m = mask_np > 0.5
-                    z2d = (e2_np/np.maximum(var_np, 1e-12))[m]
-                
+                m = (m_axes[..., d] > 0.5) if m_axes.ndim==3 else (m_axes.squeeze(-1) > 0.5)
+                z2d = ( (y_axes[..., d]**2) / np.maximum(v_np, 1e-12) )[m]
                 per_axis.append({
                     "axis": nm,
                     "Ez2": float(np.mean(z2d)),
-                    "cov68": float(np.mean(z2d<=1.0)),
-                    "cov95": float(np.mean(z2d<=3.841)),
-                    "count": int(np.sum(m))
+                    "cov68": float(np.mean(z2d <= 1.0)),
+                    "cov95": float(np.mean(z2d <= 3.841)),
+                    "count": int(m.sum())
                 })
             
             with open(os.path.join(args.out, 'per_axis.json'),'w',encoding='utf-8') as f:

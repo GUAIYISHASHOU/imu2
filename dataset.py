@@ -50,7 +50,13 @@ class IMURouteDataset(Dataset):
         if E2.ndim == 2:
             E2 = E2[..., None]
         assert E2.ndim == 3
-        assert M.ndim == 2 and M.shape[0] == X.shape[0] and M.shape[1] == X.shape[1]
+        
+        # 容错3D mask并合并为2D
+        M = M.astype(np.float32)
+        if M.ndim == 3:
+            # 与标签对齐：若任一轴无效则该时刻无效（AND）
+            M = (M > 0.5).all(axis=-1).astype(np.float32)  # (N,T)
+        assert M.ndim == 2 and M.shape[0] == X.shape[0] and M.shape[1] == X.shape[1], "Expected MASK of shape (N,T) after collapsing"
 
         self.X_all = X.astype(np.float32)
         self.E2_all = E2.astype(np.float32)
@@ -118,11 +124,20 @@ class GNSDataset(Dataset):
         return self.X.shape[0]
     
     def __getitem__(self, i):
+        y_axes = self.Y[i].astype(np.float32)            # (T,3)
+        e2_axes = (y_axes ** 2).astype(np.float32)       # (T,3)
+        e2_sum  = e2_axes.sum(axis=-1, keepdims=True)    # (T,1)  ← 训练/评测用
+        m_axes  = self.mask[i].astype(np.float32)        # (T,3)
+        m_any   = (m_axes > 0.5).all(axis=-1, keepdims=True).astype(np.float32)  # (T,1)
+
         return {
-            "X": torch.from_numpy(self.X[i]),
-            "E2": torch.from_numpy((self.Y[i]**2).astype(np.float32)),  # ENU误差的平方
-            "MASK": torch.from_numpy(self.mask[i].astype(np.float32)),
-            "Y": torch.from_numpy(self.Y[i])  # 真实方差（如果需要）
+            "X": torch.from_numpy(self.X[i]),            # (T,Din)
+            "E2": torch.from_numpy(e2_sum),              # (T,1)  ← 配合 nll_iso3_e2
+            "MASK": torch.from_numpy(m_any),             # (T,1)  ← 与上对齐
+            # 下面是作图/逐维统计需要的"富信息"
+            "Y": torch.from_numpy(y_axes),               # (T,3)
+            "MASK_AXES": torch.from_numpy(m_axes),       # (T,3)
+            "E2_AXES": torch.from_numpy(e2_axes),        # (T,3)
         }
 
 def build_dataset(route: str, npz_path: str):
