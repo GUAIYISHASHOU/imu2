@@ -130,18 +130,27 @@ def main():
                 print(f"[early-stop] No improvement for {args.early_patience} epochs. Stopping at epoch {epoch}.")
                 break
 
-    # Final test
+    # Final test - iterate over all batches like eval.py
     ckpt = torch.load(best_path, map_location="cpu")
     model.load_state_dict(ckpt["model"])
     model.to(args.device).eval()
+    
+    agg, n = None, 0
     with torch.no_grad():
-        test_batch = next(iter(test_dl))
-        test_batch = to_device(test_batch, args.device)
-        logv = model(test_batch["X"])
-        if args.route == "vis":
-            tst = route_metrics_vis(test_batch["E2"], logv, test_batch["MASK"], args.logv_min, args.logv_max)
-        else:
-            tst = route_metrics_imu(test_batch["E2"], logv, test_batch["MASK"], args.logv_min, args.logv_max)
+        for batch in test_dl:
+            batch = to_device(batch, args.device)
+            logv = model(batch["X"])
+            if args.route == "vis":
+                st = route_metrics_vis(batch["E2"], logv, batch["MASK"], args.logv_min, args.logv_max)
+            else:
+                st = route_metrics_imu(batch["E2"], logv, batch["MASK"], args.logv_min, args.logv_max)
+            if agg is None: 
+                agg = {k: 0.0 for k in st}
+            for k, v in st.items(): 
+                agg[k] += float(v)
+            n += 1
+    tst = {k: v/n for k, v in agg.items()}
+    
     with open(Path(args.run_dir)/"final_test_metrics.json","w",encoding="utf-8") as f:
         json.dump(tst, f, ensure_ascii=False, indent=2)
     print("[test]", tst)

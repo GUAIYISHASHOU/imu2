@@ -53,7 +53,7 @@ def main():
                 st = route_metrics_vis(batch["E2"], logv, batch["MASK"],
                                      logv_min=md_args.get("logv_min",-12.0),
                                      logv_max=md_args.get("logv_max",6.0),
-                                     yvar=batch.get("Y", None))
+                                     yvar=None)  # VIS路由不传yvar，避免异常指标
             else:
                 st = route_metrics_imu(batch["E2"], logv, batch["MASK"],
                                      logv_min=md_args.get("logv_min",-12.0),
