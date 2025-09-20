@@ -3,9 +3,9 @@ multi:
   seed: 42
   traj_duration_s: 2000
   rate_hz: 100
-  train_routes: 8                     # 增加训练数据量
-  val_routes: 3                       # 增加验证数据量
-  test_routes: 3                      # 增加测试数据量
+  train_routes: 24                    # 训练数据量，增加到24条路由
+  val_routes: 4                       # 验证数据量 (20%)
+  test_routes: 4                     # 测试数据量 (20%)
   # 严格共轨迹的握手文件（可选）
   save_routes_meta: data_cache/routes_meta.json   # 生成时保存
   routes_meta: null                               # 复现时读取
@@ -49,10 +49,10 @@ multi:
   noise_px: 0.35
   outlier_ratio: 0.05
 
-  # GNSS（1 Hz）- 最小化安全配置
-  gns_win: 60                         # 增加窗口长度以捕获更长时序特征
-  gns_stride: 30                      # 相应调整步长
-  gns_arch_enable: false              # 关闭 GARCH 模型进行验证
+  # GNSS（1 Hz）- 500秒长序列配置
+  gns_win: 500                        # 500秒窗口长度，捕获长期轨迹特征
+  gns_stride: 50                      # 步长设为50，增加数据重叠
+  gns_arch_enable: true               # 启用 GARCH 模型
   base_sigma_en: [0.1, 0.1]          # 核心修正：0.1米 = 1分米
   base_sigma_u: 0.2                  # 核心修正：0.2米 = 2分米
   scene_bounds: [300, 500, 600, 400, 300]  # 更多样化的场景时长
@@ -61,8 +61,8 @@ multi:
   omega: 0.02                         # 稍微增加 GARCH 基础方差
   alpha: 0.25                         # 增强误差的自相关性
   beta: 0.65                          # 调整持续性参数
-  p_out: 0.04                         # 稍微增加异常值概率
-  t_df: 2.5                           # 更重尾的异常值分布
+  p_out: 0.02                         # 更平滑的异常值概率
+  t_df: 3.5                           # 更平滑的异常值分布
   vendor_bias: 1.3                    # 厂商误差偏置
   vendor_ln_jitter: 0.25              # 增加厂商误差的随机性
 
@@ -72,32 +72,39 @@ train_gns:
   train_npz: data_gns/train_gns.npz
   val_npz:   data_gns/val_gns.npz
   test_npz:  data_gns/test_gns.npz
-  run_dir:   runs/gns_tcn
-  epochs: 50                          # 验证阶段不需要跑太久
-  batch_size: 24                      
-  lr: 0.001                           # 先用一个标准的学习率
+  run_dir:   runs/gns_tcn_fix
+  epochs: 120                         # 增加训练轮数，提高收敛稳定性
+  batch_size: 32                      # 减小批次，更稳定的训练
+  lr: 3e-4                            # 优化的学习率
   x_mode: both
   seed: 0
   # 建议的方差头边界与校准
   logv_min: -12
-  logv_max: 6                         # 核心修正：从16降到6
-  z2_center: 1e-3
-  z2_center_target: 1.0               # GNSS 用高斯目标=1
+  logv_max: 6                         # 稳定的方差预测范围
+  z2_center: 0.02                     # 从 1e-3 提升到 2e-2
+  z2_center_target: auto              # 训练中自动根据 NLL 类型设定目标
   
   # 轴感知早停和按轴自适应加权
   early_axis: true                    # 使用"最差轴 |E[z²]-1|"做早停监控
-  axis_auto_balance: true             # 按轴权重自适应调整
+  axis_auto_balance: false            # 先关；稳定后再按需打开
   axis_power: 1.2                     # 稍微增加指数，更强调差异大的轴
   axis_clip: "0.3,3.0"                # 扩大权重范围，允许更大的自适应调整
-  early_patience: 10                  # 恢复默认的耐心值
+  early_patience: 15                  # 增加耐心值
+  student_nu: 3.0                     # 启用 Student-t NLL（nu=3）
+  
+  # 新增：逐轴 vendor 软锚（可先设 0 关掉）
+  anchor_axes_weight: 0.0003
+  
+  # 新增：验证集温度缩放（自动把 z² 拉回 1）
+  post_scale: true
 
 model_gns:
-  d_model: 144                        # 增加模型容量以处理更长窗口
-  n_tcn: 12                          # 增加TCN层数，感受野≈40 min（1 Hz）
+  d_model: 96                         # 适中的模型容量
+  n_tcn: 6                           # 适中的TCN层数
   kernel_size: 3
-  n_heads: 4                         # 增加注意力头数
-  n_layers_tf: 2                     # 增加transformer层数以处理复杂时序
-  dropout: 0.12                      # 稍微增加dropout防止过拟合
+  n_heads: 2                         # 适中的注意力头数
+  n_layers_tf: 1                     # 单层transformer
+  dropout: 0.10                      # 适中的dropout
 
 eval_gns:
   route: gns

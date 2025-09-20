@@ -1,103 +1,120 @@
-1) losses.py：把硬 clamp 改成 STE（Straight-Through Estimator）clamp
+0) 配置：把训练规模与稳健性拉起来（直接覆盖）
+把你的 config.yaml 里 GNSS 段更新为下面这版（如果你的配置是分段结构，按键名合并即可）：
 
-这样前向仍使用 [logv_min, logv_max] 的值（数值安全），但反向梯度直接从未裁剪前的 logv 传回去，不会被卡死。
+yaml
+Copy
+Edit
+# —— GNSS 训练/评测（route=gns）
+train_gns:
+  route: gns
+  train_npz: data_gns/train_gns.npz
+  val_npz:   data_gns/val_gns.npz
+  test_npz:  data_gns/test_gns.npz
+  run_dir:   runs/gns_tcn_fix
+  epochs: 80
+  batch_size: 64
+  lr: 3e-4
+  x_mode: both
+  seed: 0
 
-把 losses.py 顶部改成下面这样（新增 _ste_clamp，并在所有 NLL 里用它替代原来的 torch.clamp）：
+  # 方差头边界与校准
+  logv_min: -12
+  logv_max: 6
+  z2_center: 0.02            # ← 从 1e-3 提升到 2e-2
+  z2_center_target: auto     # ← 训练中自动根据 NLL 类型设定目标
 
-from __future__ import annotations
-import torch
-import torch.nn.functional as F
+  # 轴感知/自适应（先关掉以避免追噪）
+  early_axis: true
+  axis_auto_balance: false
+  early_patience: 15
+  axis_power: 1.2
+  axis_clip: "0.3,3.0"
 
-def _ste_clamp(x: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
-    """Forward: clamp，Backward: identity（避免梯度被硬截断）"""
-    y = torch.clamp(x, min=lo, max=hi)
-    return x + (y - x).detach()
+  # 稳健 NLL（你已支持）：ν>0 切换到 Student-t
+  student_nu: 3.0
 
-def nll_iso3_e2(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
-                logv_min: float=-16.0, logv_max: float=6.0) -> torch.Tensor:
-    if logv.dim() == 3 and logv.size(-1) == 1:
-        logv = logv.squeeze(-1)
-    if e2sum.dim() == 3 and e2sum.size(-1) == 1:
-        e2sum = e2sum.squeeze(-1)
-    lv = _ste_clamp(logv, logv_min, logv_max)
-    v = torch.exp(lv).clamp_min(1e-12)
-    nll = 0.5 * (3.0 * lv + e2sum / v)
-    m = mask.float()
-    return (nll * m).sum() / torch.clamp(m.sum(), min=1.0)
+  # 新增：逐轴 vendor 软锚（可先设 0 关掉）
+  anchor_axes_weight: 0.0003
 
-def nll_iso2_e2(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
-                logv_min: float = -16.0, logv_max: float = 6.0) -> torch.Tensor:
-    if logv.dim() == 3 and logv.size(-1) == 1:
-        logv = logv.squeeze(-1)
-    if e2sum.dim() == 3 and e2sum.size(-1) == 1:
-        e2sum = e2sum.squeeze(-1)
-    lv = _ste_clamp(logv, logv_min, logv_max)
-    v = torch.exp(lv).clamp_min(1e-12)
-    m = mask.float()
-    nll = 0.5 * (2.0 * lv + e2sum / v)
-    return (nll * m).sum() / torch.clamp(m.sum(), min=1.0)
+  # 新增：验证集温度缩放（自动把 z² 拉回 1）
+  post_scale: true
 
-def mse_anchor_1d(logv: torch.Tensor, y_var: torch.Tensor, mask: torch.Tensor, lam: float=1e-3) -> torch.Tensor:
-    if logv.dim() == 3 and logv.size(-1) == 1:
-        logv = logv.squeeze(-1)
-    y = torch.clamp(y_var, min=1e-12).log()
-    m = mask.float()
-    se = (logv - y)**2 * m
+model_gns:
+  d_model: 96
+  n_tcn: 6
+  kernel_size: 3
+  n_heads: 2
+  n_layers_tf: 1
+  dropout: 0.10
+目的：把稳健性（Student-t + 更强 z² 居中）与数据/模型规模匹配（小一号模型）先对上，后面再逐步恢复更“难”的噪声设定。
+
+1) losses.py：新增“逐轴 vendor 软锚”（可选，但小样本很稳）
+你已经有 nll_studentt_diag_axes 等函数了。现在在 losses.py 里，紧跟它们新增一个逐轴 anchor（把 log-variance 轻微拉向 log(vendor^2)；与现有 mse_anchor_1d 完全同构）：
+
+python
+Copy
+Edit
+def mse_anchor_axes(logv_axes: torch.Tensor, y_var_axes: torch.Tensor, mask_axes: torch.Tensor, lam: float=1e-4) -> torch.Tensor:
+    """
+    GNSS 逐轴 log-variance 的软锚：把预测 logv 轻微拉向 log(vendor^2)。
+    logv_axes   : (B,T,3)
+    y_var_axes  : (B,T,3)  —— 逐轴 vendor 报告的方差（不是标准差）
+    mask_axes   : (B,T,3)
+    """
+    lv = logv_axes
+    y  = torch.clamp(y_var_axes, min=1e-12).log()
+    m  = mask_axes.float()
+    se = (lv - y)**2 * m
     return lam * se.sum() / torch.clamp(m.sum(), min=1.0)
+（粘贴到和 mse_anchor_1d 同一文件中即可。）
 
-def nll_diag_axes(e2_axes: torch.Tensor, logv_axes: torch.Tensor, mask_axes: torch.Tensor,
-                  logv_min: float=-16.0, logv_max: float=6.0) -> torch.Tensor:
-    lv = _ste_clamp(logv_axes, logv_min, logv_max)
-    inv_v = torch.exp(-lv)                 # (B,T,3)
-    nll = 0.5 * (e2_axes * inv_v + lv)    # (B,T,3)
-    m = mask_axes.float()
-    num = (nll * m).sum()
-    den = torch.clamp(m.sum(), min=1.0)
-    return num / den
+2) train.py：三处小改动（全部可直接贴）
+你当前的 train.py 已经：
 
-def nll_diag_axes_weighted(e2_axes: torch.Tensor, logv_axes: torch.Tensor, mask_axes: torch.Tensor,
-                           axis_w: torch.Tensor=None,
-                           logv_min: float=-16.0, logv_max: float=6.0):
-    lv = _ste_clamp(logv_axes, logv_min, logv_max)
-    inv_v = torch.exp(-lv)                    # (B,T,3)
-    nll_axes = 0.5 * (e2_axes * inv_v + lv)  # (B,T,3)
-    m = mask_axes.float()
-    num = nll_axes.mul(m).sum(dim=(0,1))      # (3,)
-    den = m.sum(dim=(0,1)).clamp_min(1.0)     # (3,)
-    per_axis = num / den                       # (3,)
-    if axis_w is None:
-        axis_w = torch.ones_like(per_axis)
-    axis_w = axis_w * (3.0 / axis_w.sum().clamp_min(1e-6))  # 归一（均值=1）
-    return (per_axis * axis_w).sum(), per_axis.detach()
+解析了 --student_nu，并在 GNSS 分支使用了 nll_studentt_diag_axes；
 
+做了 z² 居中正则；
 
-这处改动只影响 loss 的反向传播；评估指标里仍然用硬 clamp（保持统计一致）。对应原实现见你项目的 losses.py。
+打印 NLL=...；
+这些都很好。现在再做三件事：
 
-2) train.py：给方差头一个可解释的暖启动 bias（避免一上来就打到底）
+2.1 解析两个新参数
+在现有 argparse 段落添加两个参数（紧跟其它训练超参后即可）：
 
-在创建完模型后、优化器之前，加下面这段——它用一小批训练数据的均值误差来初始化 head.bias，让初始 var≈E[err²]（GNSS 逐轴），这样一开始 z²≈1，不会被 logv_min 立刻吸死。
+python
+Copy
+Edit
+ap.add_argument("--anchor_axes_weight", type=float, default=tr.get("anchor_axes_weight", 0.0),
+                help="GNSS 逐轴 vendor 软锚权重（0 关闭）")
+ap.add_argument("--post_scale", action="store_true", default=tr.get("post_scale", False),
+                help="在验证集上做一次温度缩放，把 z² 拉回 1")
+这样就能从配置里直接控制“逐轴软锚”和“温度缩放”。
 
-在 train.py 里、model = IMURouteModel(...).to(args.device) 之后插入：
+2.2 训练时（仅 GNSS）接入“逐轴 vendor 软锚”
+在 GNSS 的 loss 分支追加（就在你计算完 loss、进入 z² 居中之前）：
 
-# ---- Warm start the head bias with data statistics ----
-with torch.no_grad():
-    b = next(iter(train_dl))
-    b = to_device(b, args.device)
-    if args.route == "gns":
-        e2_axes = b["E2_AXES"].float()                 # (B,T,3)
-        m_axes  = b["MASK_AXES"].float()
-        num = (e2_axes * m_axes).sum(dim=(0,1))
-        den = m_axes.sum(dim=(0,1)).clamp_min(1.0)
-        var0 = (num / den).clamp_min(1e-12)            # (3,)
-        model.head.bias.data = var0.log().to(model.head.bias)
-    elif args.route == "vis":
-        e2 = b["E2"].float().squeeze(-1); m = b["MASK"].float()
-        var0 = ((e2 * m).sum() / m.sum() / 2.0).clamp_min(1e-12)  # df=2
-        model.head.bias.data.fill_(float(var0.log()))
+python
+Copy
+Edit
+# —— GNSS 逐轴 vendor 软锚（可选）
+if args.route == "gns" and args.anchor_axes_weight > 0 and ("VENDOR_VAR_AXES" in batch):
+    loss = loss + args.anchor_axes_weight * \
+           mse_anchor_axes(logv, batch["VENDOR_VAR_AXES"], batch["MASK_AXES"])
+其中 batch["VENDOR_VAR_AXES"] 是 (B,T,3) 的方差（不是标准差）。如果你的 Dataset 里还没有提供它，可以先把 anchor_axes_weight 设为 0，训练流程不受影响。
+
+2.3 让 z² 居中“自动目标值”支持 Student-t
+你代码里已经写了注释“若是 Student-t 则 nu/(nu-2)”，现在把它真正实现：把 z² 居中的这段修改为（仅替换 if args.z2_center > 0: 里面“目标值”计算的几行）：
+
+python
+Copy
+Edit
+# 目标值：高斯=1；若使用 Student-t 且 ν>2，则 target=ν/(ν-2)
+if args.z2_center_target == "auto":
+    if args.student_nu and args.student_nu > 2.0:
+        target = args.student_nu / (args.student_nu - 2.0)
     else:
-        e2 = b["E2"].float().squeeze(-1); m = b["MASK"].float()
-        var0 = ((e2 * m).sum() / m.sum() / 3.0).clamp_min(1e-12)  # df=3
-        model.head.bias.data.fill_(float(var0.log()))
+        target = 1.0
+else:
+    target = float(args.z2_center_target)
+这样在 student_nu=3.0 时，目标会自动设为 3/(3-2)=3.0，配合 t-NLL 让 z² 的统计量自然落在合理区间。
 
-
-（放置位置：就在你打印 [model] params=... 那块下面即可。）训练/验证打印与指标逻辑保持原样。

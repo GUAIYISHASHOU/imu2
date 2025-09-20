@@ -87,3 +87,34 @@ def nll_diag_axes_weighted(e2_axes: torch.Tensor, logv_axes: torch.Tensor, mask_
     # 归一到均值=1，便于 lr 稳定
     axis_w = axis_w * (3.0 / axis_w.sum().clamp_min(1e-6))
     return (per_axis * axis_w).sum(), per_axis.detach()
+
+def nll_studentt_diag_axes(e2_axes: torch.Tensor, logv_axes: torch.Tensor, mask_axes: torch.Tensor,
+                           nu: float = 3.0, logv_min: float = -16.0, logv_max: float = 6.0):
+    """
+    各向异性对角 Student-t NLL（逐轴）。对异常值更稳健。
+    e2_axes  : (B,T,3)   每轴误差平方
+    logv_axes: (B,T,3)   每轴 log(σ^2)
+    mask_axes: (B,T,3)   每轴有效掩码
+    nu       : 自由度参数（越小越重尾，越稳健）
+    """
+    lv = _ste_clamp(logv_axes, logv_min, logv_max)
+    v  = torch.exp(lv).clamp_min(1e-12)
+    m  = mask_axes.float()
+    # Student-t NLL（省略常数项）：0.5*log(v) + 0.5*(nu+1)*log(1 + e2/(nu*v))
+    nll = 0.5*lv + 0.5*(nu + 1.0) * torch.log1p(e2_axes / (v * nu))
+    num = (nll * m).sum()
+    den = m.sum().clamp_min(1.0)
+    return num / den
+
+def mse_anchor_axes(logv_axes: torch.Tensor, y_var_axes: torch.Tensor, mask_axes: torch.Tensor, lam: float=1e-4) -> torch.Tensor:
+    """
+    GNSS 逐轴 log-variance 的软锚：把预测 logv 轻微拉向 log(vendor^2)。
+    logv_axes   : (B,T,3)
+    y_var_axes  : (B,T,3)  —— 逐轴 vendor 报告的方差（不是标准差）
+    mask_axes   : (B,T,3)
+    """
+    lv = logv_axes
+    y  = torch.clamp(y_var_axes, min=1e-12).log()
+    m  = mask_axes.float()
+    se = (lv - y)**2 * m
+    return lam * se.sum() / torch.clamp(m.sum(), min=1.0)

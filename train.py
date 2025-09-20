@@ -8,7 +8,7 @@ from torch.optim import AdamW
 from utils import seed_everything, to_device, count_params, load_config_file
 from dataset import build_loader
 from models import IMURouteModel
-from losses import nll_iso3_e2, nll_iso2_e2, mse_anchor_1d, nll_diag_axes, nll_diag_axes_weighted
+from losses import nll_iso3_e2, nll_iso2_e2, mse_anchor_1d, nll_diag_axes, nll_diag_axes_weighted, nll_studentt_diag_axes, mse_anchor_axes
 from metrics import route_metrics_imu, route_metrics_vis, route_metrics_gns_axes
 
 def parse_args():
@@ -74,12 +74,19 @@ def parse_args():
                     help="轴权重 ~ dev^p 的指数 p")
     ap.add_argument("--axis_clip", type=str, default=tr.get("axis_clip", "0.5,2.0"),
                     help="权重裁剪区间 lo,hi")
+    ap.add_argument("--student_nu", type=float, default=tr.get("student_nu", 0.0),
+                    help="Student-t 自由度参数（0=使用高斯NLL，>0=使用t-NLL，推荐3.0）")
+    ap.add_argument("--anchor_axes_weight", type=float, default=tr.get("anchor_axes_weight", 0.0),
+                    help="GNSS 逐轴 vendor 软锚权重（0 关闭）")
+    ap.add_argument("--post_scale", action="store_true", default=tr.get("post_scale", False),
+                    help="在验证集上做一次温度缩放，把 z² 拉回 1")
     ap.add_argument("--device", default=rt.get("device","cuda" if torch.cuda.is_available() else "cpu"))
 
     args = ap.parse_args()
 
     # 启动时打印边界，防止再踩到"没有用上配置段"的坑
-    print(f"[args] route={args.route}  logv_min={args.logv_min}  logv_max={args.logv_max}")
+    nll_type = f"Student-t(ν={args.student_nu})" if args.student_nu > 0 else "Gaussian"
+    print(f"[args] route={args.route}  logv_min={args.logv_min}  logv_max={args.logv_max}  NLL={nll_type}")
 
     return args
 
@@ -161,14 +168,26 @@ def main():
                 loss = nll_iso2_e2(batch["E2"], logv, m,
                                    logv_min=args.logv_min, logv_max=args.logv_max)
             elif args.route == "gns":
-                # GNSS：逐轴各向异性（可选按轴加权）
-                if args.axis_auto_balance:
+                # GNSS：逐轴各向异性（可选按轴加权 + Student-t NLL）
+                if args.student_nu > 0:
+                    # 使用稳健的 Student-t NLL（对异常值更稳健）
+                    loss = nll_studentt_diag_axes(batch["E2_AXES"], logv, batch["MASK_AXES"],
+                                                  nu=args.student_nu,
+                                                  logv_min=args.logv_min, logv_max=args.logv_max)
+                elif args.axis_auto_balance:
+                    # 使用加权高斯 NLL
                     loss, per_axis_nll = nll_diag_axes_weighted(batch["E2_AXES"], logv, batch["MASK_AXES"],
                                                                 axis_w=axis_w,
                                                                 logv_min=args.logv_min, logv_max=args.logv_max)
                 else:
+                    # 使用标准高斯 NLL
                     loss = nll_diag_axes(batch["E2_AXES"], logv, batch["MASK_AXES"],
                                          logv_min=args.logv_min, logv_max=args.logv_max)
+                
+                # —— GNSS 逐轴 vendor 软锚（可选）
+                if args.anchor_axes_weight > 0 and ("VENDOR_VAR_AXES" in batch):
+                    loss = loss + mse_anchor_axes(logv, batch["VENDOR_VAR_AXES"], batch["MASK_AXES"], 
+                                                 lam=args.anchor_axes_weight)
             else:
                 # IMU (acc/gyr)
                 loss = nll_iso3_e2(batch["E2"], logv, m,
@@ -201,9 +220,12 @@ def main():
                     z2 = (e2 / v) / df
                 mean_z2 = (z2 * m_float).sum() / m_float.clamp_min(1.0).sum()
                 
-                # 目标值：高斯=1；若是 Student-t 则 nu/(nu-2)
+                # 目标值：高斯=1；若使用 Student-t 且 ν>2，则 target=ν/(ν-2)
                 if args.z2_center_target == "auto":
-                    target = 1.0  # 默认高斯目标
+                    if args.student_nu and args.student_nu > 2.0:
+                        target = args.student_nu / (args.student_nu - 2.0)
+                    else:
+                        target = 1.0
                 else:
                     target = float(args.z2_center_target)
                 
