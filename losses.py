@@ -1,5 +1,11 @@
 from __future__ import annotations
 import torch
+import torch.nn.functional as F
+
+def _ste_clamp(x: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
+    """Forward: clamp，Backward: identity（避免梯度被硬截断）"""
+    y = torch.clamp(x, min=lo, max=hi)
+    return x + (y - x).detach()
 
 def nll_iso3_e2(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
                 logv_min: float=-16.0, logv_max: float=6.0) -> torch.Tensor:
@@ -13,9 +19,9 @@ def nll_iso3_e2(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
         logv = logv.squeeze(-1)
     if e2sum.dim() == 3 and e2sum.size(-1) == 1:
         e2sum = e2sum.squeeze(-1)
-    logv = torch.clamp(logv, min=logv_min, max=logv_max)
-    v = torch.exp(logv)
-    nll = 0.5 * (3.0 * logv + e2sum / v)
+    lv = _ste_clamp(logv, logv_min, logv_max)
+    v = torch.exp(lv).clamp_min(1e-12)
+    nll = 0.5 * (3.0 * lv + e2sum / v)
     m = mask.float()
     return (nll * m).sum() / torch.clamp(m.sum(), min=1.0)
 
@@ -26,10 +32,10 @@ def nll_iso2_e2(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
         logv = logv.squeeze(-1)
     if e2sum.dim() == 3 and e2sum.size(-1) == 1:
         e2sum = e2sum.squeeze(-1)
-    logv = torch.clamp(logv, min=logv_min, max=logv_max)
-    v = torch.exp(logv)
+    lv = _ste_clamp(logv, logv_min, logv_max)
+    v = torch.exp(lv).clamp_min(1e-12)
     m = mask.float()
-    nll = 0.5 * (2.0 * logv + e2sum / v)
+    nll = 0.5 * (2.0 * lv + e2sum / v)
     return (nll * m).sum() / torch.clamp(m.sum(), min=1.0)
 
 
@@ -53,7 +59,7 @@ def nll_diag_axes(e2_axes: torch.Tensor, logv_axes: torch.Tensor, mask_axes: tor
     logv_axes: (B,T,3)   每轴 log(σ^2)
     mask_axes: (B,T,3)   每轴有效掩码
     """
-    lv = torch.clamp(logv_axes, min=logv_min, max=logv_max)
+    lv = _ste_clamp(logv_axes, logv_min, logv_max)
     inv_v = torch.exp(-lv)                 # (B,T,3)
     nll = 0.5 * (e2_axes * inv_v + lv)    # (B,T,3)
     m = mask_axes.float()
@@ -69,7 +75,7 @@ def nll_diag_axes_weighted(e2_axes: torch.Tensor, logv_axes: torch.Tensor, mask_
     e2_axes, logv_axes, mask_axes: (B,T,3)
     axis_w: (3,) 归一到均值=1 更稳（外部可先做归一化）
     """
-    lv = torch.clamp(logv_axes, min=logv_min, max=logv_max)
+    lv = _ste_clamp(logv_axes, logv_min, logv_max)
     inv_v = torch.exp(-lv)                    # (B,T,3)
     nll_axes = 0.5 * (e2_axes * inv_v + lv)  # (B,T,3)
     m = mask_axes.float()

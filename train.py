@@ -12,23 +12,37 @@ from losses import nll_iso3_e2, nll_iso2_e2, mse_anchor_1d, nll_diag_axes, nll_d
 from metrics import route_metrics_imu, route_metrics_vis, route_metrics_gns_axes
 
 def parse_args():
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--config", type=str, default=None, help="YAML/JSON 配置文件")
-    args_pre, _ = pre.parse_known_args()
+    # 先只解析 --config 和 --route（不加载其它参数）
+    pre_cfg = argparse.ArgumentParser(add_help=False)
+    pre_cfg.add_argument("--config", type=str, default=None, help="YAML/JSON 配置文件")
+    pre_route = argparse.ArgumentParser(add_help=False)
+    pre_route.add_argument("--route", choices=["acc","gyr","vis","gns"], default=None)
 
-    cfg = load_config_file(args_pre.config)
-    
-    # 根据路由读取不同的配置段
-    route_prefix = ""
-    if args_pre.config and "gns" in str(args_pre.config).lower():
-        route_prefix = "gns_"
-    
-    tr = cfg.get(f"train_{route_prefix}".rstrip("_"), cfg.get("train", {}))
-    md = cfg.get(f"model_{route_prefix}".rstrip("_"), cfg.get("model", {}))
+    args_pre_cfg, _ = pre_cfg.parse_known_args()
+    args_pre_route, _ = pre_route.parse_known_args()
+
+    cfg = load_config_file(args_pre_cfg.config)
+
+    # 根据"命令行的 --route（优先）"或"配置里是否存在 train_gns 段（兜底）"选择前缀
+    if args_pre_route.route is not None:
+        route_hint = args_pre_route.route
+    else:
+        # 配置文件没有 route 明示时，用是否存在 train_gns/model_gns 来猜测
+        route_hint = "gns" if ("train_gns" in cfg or "model_gns" in cfg or "eval_gns" in cfg) else "acc"
+
+    if route_hint == "gns":
+        tr = cfg.get("train_gns", cfg.get("train", {}))
+        md = cfg.get("model_gns", cfg.get("model", {}))
+    else:
+        tr = cfg.get("train", {})
+        md = cfg.get("model", {})
+
     rt = cfg.get("runtime", {})
 
-    ap = argparse.ArgumentParser("Train single-route IMU variance model", parents=[pre])
-    ap.add_argument("--route", choices=["acc","gyr","vis","gns"], default=tr.get("route","acc"), help="Which route to train")
+    # 真正的参数解析器
+    ap = argparse.ArgumentParser("Train single-route IMU variance model", parents=[pre_cfg])
+    ap.add_argument("--route", choices=["acc","gyr","vis","gns"], default=tr.get("route", route_hint),
+                    help="Which route to train")
     ap.add_argument("--train_npz", required=(tr.get("train_npz") is None), default=tr.get("train_npz"))
     ap.add_argument("--val_npz", required=(tr.get("val_npz") is None), default=tr.get("val_npz"))
     ap.add_argument("--test_npz", required=(tr.get("test_npz") is None), default=tr.get("test_npz"))
@@ -51,7 +65,7 @@ def parse_args():
     ap.add_argument("--z2_center_target", type=str, default=tr.get("z2_center_target","auto"), help="z²目标值: 'auto' 或数字")
     ap.add_argument("--anchor_weight", type=float, default=tr.get("anchor_weight",0.0))
     ap.add_argument("--early_patience", type=int, default=tr.get("early_patience", 10))
-    # 轴感知 & 自适应
+    # 轴感知 & 自适应（只对 GNSS 有效，但参数照常解析）
     ap.add_argument("--early_axis", action="store_true", default=tr.get("early_axis", True),
                     help="使用'最差轴 |E[z²]-1|'做早停监控（GNSS）")
     ap.add_argument("--axis_auto_balance", action="store_true", default=tr.get("axis_auto_balance", True),
@@ -61,7 +75,13 @@ def parse_args():
     ap.add_argument("--axis_clip", type=str, default=tr.get("axis_clip", "0.5,2.0"),
                     help="权重裁剪区间 lo,hi")
     ap.add_argument("--device", default=rt.get("device","cuda" if torch.cuda.is_available() else "cpu"))
-    return ap.parse_args()
+
+    args = ap.parse_args()
+
+    # 启动时打印边界，防止再踩到"没有用上配置段"的坑
+    print(f"[args] route={args.route}  logv_min={args.logv_min}  logv_max={args.logv_max}")
+
+    return args
 
 def main():
     args = parse_args()
@@ -95,6 +115,29 @@ def main():
     model = IMURouteModel(d_in=d_in, d_out=d_out, d_model=args.d_model, n_tcn=args.n_tcn, kernel_size=args.kernel_size,
                           n_layers_tf=args.n_layers_tf, n_heads=args.n_heads, dropout=args.dropout).to(args.device)
     print(f"[model] params={count_params(model):,}  d_in={d_in}  d_out={d_out}")
+
+    # ---- Warm start the head bias with data statistics ----
+    with torch.no_grad():
+        b = next(iter(train_dl))
+        b = to_device(b, args.device)
+        if args.route == "gns":
+            e2_axes = b["E2_AXES"].float()                 # (B,T,3)
+            m_axes  = b["MASK_AXES"].float()
+            num = (e2_axes * m_axes).sum(dim=(0,1))
+            den = m_axes.sum(dim=(0,1)).clamp_min(1.0)
+            var0 = (num / den).clamp_min(1e-12)            # (3,)
+            model.head.bias.data = var0.log().to(model.head.bias)
+            print(f"[warm-start] GNSS head bias initialized: E={var0[0]:.3e}, N={var0[1]:.3e}, U={var0[2]:.3e}")
+        elif args.route == "vis":
+            e2 = b["E2"].float().squeeze(-1); m = b["MASK"].float()
+            var0 = ((e2 * m).sum() / m.sum() / 2.0).clamp_min(1e-12)  # df=2
+            model.head.bias.data.fill_(float(var0.log()))
+            print(f"[warm-start] VIS head bias initialized: var={var0:.3e}")
+        else:
+            e2 = b["E2"].float().squeeze(-1); m = b["MASK"].float()
+            var0 = ((e2 * m).sum() / m.sum() / 3.0).clamp_min(1e-12)  # df=3
+            model.head.bias.data.fill_(float(var0.log()))
+            print(f"[warm-start] IMU head bias initialized: var={var0:.3e}")
 
     opt = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     best_val = 1e9   # 兼容原有基于 val_loss 的逻辑
@@ -223,7 +266,8 @@ def main():
 
         print(f"[epoch {epoch:03d}] train_loss={tr_loss:.4f}  val_loss={val_loss:.4f}"
               f" z2_mean={stats['z2_mean']:.3f} cov68={stats['cov68']:.3f} cov95={stats['cov95']:.3f} "
-              f"spear={stats['spear']:.3f} sat={stats['sat']:.3f}{ez2_axes_print}  time={time.time()-t0:.1f}s")
+              f"spear={stats['spear']:.3f} sat={stats['sat']:.3f}(↓{stats.get('sat_min',0):.3f}↑{stats.get('sat_max',0):.3f})"
+              f"{ez2_axes_print}  time={time.time()-t0:.1f}s")
 
         # === A：轴感知早停 ===
         improved = False

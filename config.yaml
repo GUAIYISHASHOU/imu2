@@ -3,9 +3,9 @@ multi:
   seed: 42
   traj_duration_s: 2000
   rate_hz: 100
-  train_routes: 6
-  val_routes: 2
-  test_routes: 2
+  train_routes: 8                     # 增加训练数据量
+  val_routes: 3                       # 增加验证数据量
+  test_routes: 3                      # 增加测试数据量
   # 严格共轨迹的握手文件（可选）
   save_routes_meta: data_cache/routes_meta.json   # 生成时保存
   routes_meta: null                               # 复现时读取
@@ -20,6 +20,25 @@ multi:
   vis_out: data_vis
   gns_out: data_gns
 
+  # === 新增：engine_builtin 车辆动力学参数 ===
+  # 车辆几何参数
+  wheelbase: 2.7                      # [m] 轴距
+  # 速度与加速度限制
+  v_max: 25.0                         # [m/s] 最大速度（城市场景适中）
+  a_lon_max: 2.5                      # [m/s²] 纵向加速度限制
+  a_lat_max: 4.0                      # [m/s²] 侧向加速度限制
+  # 转向系统参数
+  delta_max_deg: 30.0                 # [deg] 最大转向角
+  ddelta_max_deg: 25.0                # [deg/s] 转向角速度限制
+  tau_delta: 0.3                      # [s] 转向系统时间常数
+  # 曲率连续性参数（A+ 引擎核心）
+  sigma_max: 4e-3                     # [1/m²] 曲率变化率限制（增加灵活性）
+  jerk_lat_max: 2.0                   # [m/s³] 侧向加加速度限制（动态约束）
+  # 场景与地形
+  scenario: "city"                    # "city" 或 "highway"
+  grade_sigma: "0.015,0.035"          # 坡度标准差范围（稍微增加地形变化）
+  grade_tau_s: "80,200"               # 坡度变化时间常数
+
   # IMU（100 Hz）
   imu_window: 256
   imu_stride: 128
@@ -30,22 +49,22 @@ multi:
   noise_px: 0.35
   outlier_ratio: 0.05
 
-  # GNSS（1 Hz）
-  gns_win: 50
-  gns_stride: 25
-  gns_arch_enable: true
-  base_sigma_en: [0.7, 0.7]
-  base_sigma_u: 1.8
-  scene_bounds: [400, 400, 400, 400, 400]
-  scene_gain_en: [1.0, 1.5, 2.0, 1.2, 1.0]
-  scene_gain_u:  [1.2, 1.8, 2.5, 1.5, 1.2]
-  omega: 0.01
-  alpha: 0.15
-  beta: 0.75
-  p_out: 0.03
-  t_df: 3.0
-  vendor_bias: 1.4
-  vendor_ln_jitter: 0.2
+  # GNSS（1 Hz）- 最小化安全配置
+  gns_win: 60                         # 增加窗口长度以捕获更长时序特征
+  gns_stride: 30                      # 相应调整步长
+  gns_arch_enable: false              # 关闭 GARCH 模型进行验证
+  base_sigma_en: [0.1, 0.1]          # 核心修正：0.1米 = 1分米
+  base_sigma_u: 0.2                  # 核心修正：0.2米 = 2分米
+  scene_bounds: [300, 500, 600, 400, 300]  # 更多样化的场景时长
+  scene_gain_en: [1.0, 2.0, 3.5, 1.8, 1.0] # 场景增益可以暂时保留
+  scene_gain_u:  [1.5, 2.5, 4.0, 2.2, 1.5] # 
+  omega: 0.02                         # 稍微增加 GARCH 基础方差
+  alpha: 0.25                         # 增强误差的自相关性
+  beta: 0.65                          # 调整持续性参数
+  p_out: 0.04                         # 稍微增加异常值概率
+  t_df: 2.5                           # 更重尾的异常值分布
+  vendor_bias: 1.3                    # 厂商误差偏置
+  vendor_ln_jitter: 0.25              # 增加厂商误差的随机性
 
 # —— GNSS 训练/评测（route=gns）
 train_gns:
@@ -54,30 +73,31 @@ train_gns:
   val_npz:   data_gns/val_gns.npz
   test_npz:  data_gns/test_gns.npz
   run_dir:   runs/gns_tcn
-  epochs: 200
-  batch_size: 32
-  lr: 0.001
+  epochs: 50                          # 验证阶段不需要跑太久
+  batch_size: 24                      
+  lr: 0.001                           # 先用一个标准的学习率
   x_mode: both
   seed: 0
   # 建议的方差头边界与校准
   logv_min: -12
-  logv_max: 5
+  logv_max: 6                         # 核心修正：从16降到6
   z2_center: 1e-3
-  z2_center_target: 1.0   # GNSS 用高斯目标=1
+  z2_center_target: 1.0               # GNSS 用高斯目标=1
   
   # 轴感知早停和按轴自适应加权
-  early_axis: true        # 使用"最差轴 |E[z²]-1|"做早停监控
-  axis_auto_balance: true # 按轴权重自适应调整
-  axis_power: 1.0         # 轴权重 ~ dev^p 的指数p
-  axis_clip: "0.5,2.0"    # 权重裁剪区间 [lo,hi]
+  early_axis: true                    # 使用"最差轴 |E[z²]-1|"做早停监控
+  axis_auto_balance: true             # 按轴权重自适应调整
+  axis_power: 1.2                     # 稍微增加指数，更强调差异大的轴
+  axis_clip: "0.3,3.0"                # 扩大权重范围，允许更大的自适应调整
+  early_patience: 10                  # 恢复默认的耐心值
 
 model_gns:
-  d_model: 128
-  n_tcn: 10           # 空洞卷积感受野≈34 min（1 Hz）
+  d_model: 144                        # 增加模型容量以处理更长窗口
+  n_tcn: 12                          # 增加TCN层数，感受野≈40 min（1 Hz）
   kernel_size: 3
-  n_heads: 2
-  n_layers_tf: 1      # 一层小注意力足够
-  dropout: 0.1
+  n_heads: 4                         # 增加注意力头数
+  n_layers_tf: 2                     # 增加transformer层数以处理复杂时序
+  dropout: 0.12                      # 稍微增加dropout防止过拟合
 
 eval_gns:
   route: gns

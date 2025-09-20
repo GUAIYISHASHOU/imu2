@@ -1,151 +1,103 @@
-1）losses.py：加入“按轴加权”逐轴 NLL
+1) losses.py：把硬 clamp 改成 STE（Straight-Through Estimator）clamp
 
-（保留你现有 nll_diag_axes 不动）
+这样前向仍使用 [logv_min, logv_max] 的值（数值安全），但反向梯度直接从未裁剪前的 logv 传回去，不会被卡死。
 
-*** a/losses.py
---- b/losses.py
-@@
- def nll_diag_axes(e2_axes: torch.Tensor, logv_axes: torch.Tensor, mask_axes: torch.Tensor,
-                   logv_min: float=-16.0, logv_max: float=6.0) -> torch.Tensor:
-@@
-     return num / den
-+
-+def nll_diag_axes_weighted(e2_axes: torch.Tensor, logv_axes: torch.Tensor, mask_axes: torch.Tensor,
-+                           axis_w: torch.Tensor=None,
-+                           logv_min: float=-16.0, logv_max: float=6.0):
-+    """
-+    各向异性对角高斯 NLL（逐轴）+ 按轴权重。
-+    e2_axes, logv_axes, mask_axes: (B,T,3)
-+    axis_w: (3,) 归一到均值=1 更稳（外部可先做归一化）
-+    """
-+    lv = torch.clamp(logv_axes, min=logv_min, max=logv_max)
-+    inv_v = torch.exp(-lv)                    # (B,T,3)
-+    nll_axes = 0.5 * (e2_axes * inv_v + lv)  # (B,T,3)
-+    m = mask_axes.float()
-+    num = nll_axes.mul(m).sum(dim=(0,1))      # (3,)
-+    den = m.sum(dim=(0,1)).clamp_min(1.0)     # (3,)
-+    per_axis = num / den                       # (3,)
-+    if axis_w is None:
-+        axis_w = torch.ones_like(per_axis)
-+    # 归一到均值=1，便于 lr 稳定
-+    axis_w = axis_w * (3.0 / axis_w.sum().clamp_min(1e-6))
-+    return (per_axis * axis_w).sum(), per_axis.detach()
+把 losses.py 顶部改成下面这样（新增 _ste_clamp，并在所有 NLL 里用它替代原来的 torch.clamp）：
 
-2）train.py：增加“轴感知早停 + 按轴自适应加权”
+from __future__ import annotations
+import torch
+import torch.nn.functional as F
 
-（基于你现有的 GNSS 逐轴训练路径与验证统计，保持其它路由不变。）
+def _ste_clamp(x: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
+    """Forward: clamp，Backward: identity（避免梯度被硬截断）"""
+    y = torch.clamp(x, min=lo, max=hi)
+    return x + (y - x).detach()
 
-*** a/train.py
---- b/train.py
-@@
--from losses import nll_iso3_e2, nll_iso2_e2, mse_anchor_1d, nll_diag_axes
-+from losses import nll_iso3_e2, nll_iso2_e2, mse_anchor_1d, nll_diag_axes, nll_diag_axes_weighted
-@@ def parse_args():
-     ap.add_argument("--early_patience", type=int, default=tr.get("early_patience", 10))
-+    # 轴感知 & 自适应
-+    ap.add_argument("--early_axis", action="store_true", default=tr.get("early_axis", True),
-+                    help="使用“最差轴 |E[z²]-1|”做早停监控（GNSS）")
-+    ap.add_argument("--axis_auto_balance", action="store_true", default=tr.get("axis_auto_balance", True),
-+                    help="对 GNSS 逐轴 NLL 引入按轴权重，并按验证集 |E[z²]-1| 自适应更新")
-+    ap.add_argument("--axis_power", type=float, default=tr.get("axis_power", 1.0),
-+                    help="轴权重 ~ dev^p 的指数 p")
-+    ap.add_argument("--axis_clip", type=str, default=tr.get("axis_clip", "0.5,2.0"),
-+                    help="权重裁剪区间 lo,hi")
-@@ def main():
--    best_val = 1e9
-+    best_val = 1e9   # 兼容原有基于 val_loss 的逻辑
-+    best_worst = 1e9 # 轴感知用
-     epochs_since_improve = 0
-@@
-+    # 轴权重（仅 GNSS 生效）
-+    lo, hi = map(float, args.axis_clip.split(","))
-+    axis_w = torch.ones(3, device=args.device)
-+
-     def run_epoch(loader, training: bool):
-         model.train(training)
-         total_loss = 0.0
-         n_batches = 0
-         for batch in loader:
-@@
--            elif args.route == "gns":
--                # GNSS：逐轴各向异性 NLL（E/N/U 三通道）
--                loss = nll_diag_axes(batch["E2_AXES"], logv, batch["MASK_AXES"],
--                                     logv_min=args.logv_min, logv_max=args.logv_max)
-+            elif args.route == "gns":
-+                # GNSS：逐轴各向异性（可选按轴加权）
-+                if args.axis_auto_balance:
-+                    loss, per_axis_nll = nll_diag_axes_weighted(batch["E2_AXES"], logv, batch["MASK_AXES"],
-+                                                                axis_w=axis_w,
-+                                                                logv_min=args.logv_min, logv_max=args.logv_max)
-+                else:
-+                    loss = nll_diag_axes(batch["E2_AXES"], logv, batch["MASK_AXES"],
-+                                         logv_min=args.logv_min, logv_max=args.logv_max)
-@@
-         return total_loss / max(n_batches,1)
-@@
-     for epoch in range(1, args.epochs+1):
-         t0 = time.time()
-         tr_loss = run_epoch(train_dl, training=True)
-         with torch.no_grad():
-             model.eval()
--            val_loss = run_epoch(val_dl, training=False)
-+            val_loss = run_epoch(val_dl, training=False)
-+
-+            # === 轴感知统计（GNSS）===
-+            worst_dev = None
-+            ez2_axes_print = ""
-+            if args.route == "gns":
-+                num = torch.zeros(3, device=args.device)
-+                den = torch.zeros(3, device=args.device)
-+                for val_batch in val_dl:
-+                    val_batch = to_device(val_batch, args.device)
-+                    logv = model(val_batch["X"])                     # (B,T,3)
-+                    lv = torch.clamp(logv, min=args.logv_min, max=args.logv_max)
-+                    v  = torch.exp(lv).clamp_min(1e-12)
-+                    e2 = val_batch["E2_AXES"]                        # (B,T,3)
-+                    m  = val_batch["MASK_AXES"].float()              # (B,T,3)
-+                    z2 = e2 / v
-+                    num += (z2 * m).sum(dim=(0,1))
-+                    den += m.sum(dim=(0,1)).clamp_min(1.0)
-+                ez2_axes = (num / den).detach()                      # (3,)
-+                worst_dev = torch.abs(ez2_axes - 1.0).max().item()
-+                ez2_axes_print = f" ez2[E,N,U]=[{ez2_axes[0]:.3f},{ez2_axes[1]:.3f},{ez2_axes[2]:.3f}] worst={worst_dev:.3f}"
-+
-+                # 按轴自适应权重（B）：谁偏得远谁更重
-+                if args.axis_auto_balance:
-+                    dev = (ez2_axes - 1.0).abs().clamp_min(1e-3)     # (3,)
-+                    new_w = dev.pow(args.axis_power)
-+                    new_w = (new_w / new_w.mean()).clamp_(lo, hi)     # 归一 + 裁剪
-+                    axis_w = new_w.detach()
- 
--        print(f"[epoch {epoch:03d}] train_loss={tr_loss:.4f}  val_loss={val_loss:.4f}  "
-+        print(f"[epoch {epoch:03d}] train_loss={tr_loss:.4f}  val_loss={val_loss:.4f}"
-               f" z2_mean={stats['z2_mean']:.3f} cov68={stats['cov68']:.3f} cov95={stats['cov95']:.3f} "
--              f"spear={stats['spear']:.3f} sat={stats['sat']:.3f}  time={time.time()-t0:.1f}s")
-+              f"spear={stats['spear']:.3f} sat={stats['sat']:.3f}{ez2_axes_print}  time={time.time()-t0:.1f}s")
- 
--        if val_loss < best_val:
--            best_val = val_loss
--            epochs_since_improve = 0
--            torch.save({"model": model.state_dict(), "args": vars(args)}, best_path)
--        else:
--            epochs_since_improve += 1
-+        # === A：轴感知早停 ===
-+        improved = False
-+        if args.route == "gns" and args.early_axis and worst_dev is not None:
-+            if epoch == 1 or worst_dev < best_worst:
-+                best_worst = worst_dev
-+                improved = True
-+        else:
-+            if val_loss < best_val:
-+                best_val = val_loss
-+                improved = True
-+
-+        if improved:
-+            epochs_since_improve = 0
-+            torch.save({"model": model.state_dict(), "args": vars(args)}, best_path)
-+        else:
-+            epochs_since_improve += 1
-             if epochs_since_improve >= args.early_patience:
-                 print(f"[early-stop] No improvement for {args.early_patience} epochs. Stopping at epoch {epoch}.")
-                 break
+def nll_iso3_e2(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
+                logv_min: float=-16.0, logv_max: float=6.0) -> torch.Tensor:
+    if logv.dim() == 3 and logv.size(-1) == 1:
+        logv = logv.squeeze(-1)
+    if e2sum.dim() == 3 and e2sum.size(-1) == 1:
+        e2sum = e2sum.squeeze(-1)
+    lv = _ste_clamp(logv, logv_min, logv_max)
+    v = torch.exp(lv).clamp_min(1e-12)
+    nll = 0.5 * (3.0 * lv + e2sum / v)
+    m = mask.float()
+    return (nll * m).sum() / torch.clamp(m.sum(), min=1.0)
+
+def nll_iso2_e2(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
+                logv_min: float = -16.0, logv_max: float = 6.0) -> torch.Tensor:
+    if logv.dim() == 3 and logv.size(-1) == 1:
+        logv = logv.squeeze(-1)
+    if e2sum.dim() == 3 and e2sum.size(-1) == 1:
+        e2sum = e2sum.squeeze(-1)
+    lv = _ste_clamp(logv, logv_min, logv_max)
+    v = torch.exp(lv).clamp_min(1e-12)
+    m = mask.float()
+    nll = 0.5 * (2.0 * lv + e2sum / v)
+    return (nll * m).sum() / torch.clamp(m.sum(), min=1.0)
+
+def mse_anchor_1d(logv: torch.Tensor, y_var: torch.Tensor, mask: torch.Tensor, lam: float=1e-3) -> torch.Tensor:
+    if logv.dim() == 3 and logv.size(-1) == 1:
+        logv = logv.squeeze(-1)
+    y = torch.clamp(y_var, min=1e-12).log()
+    m = mask.float()
+    se = (logv - y)**2 * m
+    return lam * se.sum() / torch.clamp(m.sum(), min=1.0)
+
+def nll_diag_axes(e2_axes: torch.Tensor, logv_axes: torch.Tensor, mask_axes: torch.Tensor,
+                  logv_min: float=-16.0, logv_max: float=6.0) -> torch.Tensor:
+    lv = _ste_clamp(logv_axes, logv_min, logv_max)
+    inv_v = torch.exp(-lv)                 # (B,T,3)
+    nll = 0.5 * (e2_axes * inv_v + lv)    # (B,T,3)
+    m = mask_axes.float()
+    num = (nll * m).sum()
+    den = torch.clamp(m.sum(), min=1.0)
+    return num / den
+
+def nll_diag_axes_weighted(e2_axes: torch.Tensor, logv_axes: torch.Tensor, mask_axes: torch.Tensor,
+                           axis_w: torch.Tensor=None,
+                           logv_min: float=-16.0, logv_max: float=6.0):
+    lv = _ste_clamp(logv_axes, logv_min, logv_max)
+    inv_v = torch.exp(-lv)                    # (B,T,3)
+    nll_axes = 0.5 * (e2_axes * inv_v + lv)  # (B,T,3)
+    m = mask_axes.float()
+    num = nll_axes.mul(m).sum(dim=(0,1))      # (3,)
+    den = m.sum(dim=(0,1)).clamp_min(1.0)     # (3,)
+    per_axis = num / den                       # (3,)
+    if axis_w is None:
+        axis_w = torch.ones_like(per_axis)
+    axis_w = axis_w * (3.0 / axis_w.sum().clamp_min(1e-6))  # 归一（均值=1）
+    return (per_axis * axis_w).sum(), per_axis.detach()
+
+
+这处改动只影响 loss 的反向传播；评估指标里仍然用硬 clamp（保持统计一致）。对应原实现见你项目的 losses.py。
+
+2) train.py：给方差头一个可解释的暖启动 bias（避免一上来就打到底）
+
+在创建完模型后、优化器之前，加下面这段——它用一小批训练数据的均值误差来初始化 head.bias，让初始 var≈E[err²]（GNSS 逐轴），这样一开始 z²≈1，不会被 logv_min 立刻吸死。
+
+在 train.py 里、model = IMURouteModel(...).to(args.device) 之后插入：
+
+# ---- Warm start the head bias with data statistics ----
+with torch.no_grad():
+    b = next(iter(train_dl))
+    b = to_device(b, args.device)
+    if args.route == "gns":
+        e2_axes = b["E2_AXES"].float()                 # (B,T,3)
+        m_axes  = b["MASK_AXES"].float()
+        num = (e2_axes * m_axes).sum(dim=(0,1))
+        den = m_axes.sum(dim=(0,1)).clamp_min(1.0)
+        var0 = (num / den).clamp_min(1e-12)            # (3,)
+        model.head.bias.data = var0.log().to(model.head.bias)
+    elif args.route == "vis":
+        e2 = b["E2"].float().squeeze(-1); m = b["MASK"].float()
+        var0 = ((e2 * m).sum() / m.sum() / 2.0).clamp_min(1e-12)  # df=2
+        model.head.bias.data.fill_(float(var0.log()))
+    else:
+        e2 = b["E2"].float().squeeze(-1); m = b["MASK"].float()
+        var0 = ((e2 * m).sum() / m.sum() / 3.0).clamp_min(1e-12)  # df=3
+        model.head.bias.data.fill_(float(var0.log()))
+
+
+（放置位置：就在你打印 [model] params=... 那块下面即可。）训练/验证打印与指标逻辑保持原样。
