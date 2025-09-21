@@ -5,3 +5,4 @@ data_vis/
 __pycache__/
 trajectory_plots/
 data_gns/
+plots_gns/

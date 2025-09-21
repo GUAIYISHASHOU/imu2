@@ -4,20 +4,62 @@ from pathlib import Path
 import torch
 import matplotlib.pyplot as plt
 
-from utils import to_device
+from utils import to_device, load_config_file
 from dataset import build_loader
 from models import IMURouteModel
 
 def parse_args():
-    ap = argparse.ArgumentParser("Save diagnostics plots for a single-route model")
-    ap.add_argument("--route", choices=["acc","gyr","vis","gns"], required=True)
-    ap.add_argument("--npz", required=True)
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--x_mode", choices=["both","route_only"], default="both")
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--use_loglog", action="store_true", help="使用对数坐标散点图（推荐）")
+    # 先解析 --config 和 --route 参数
+    pre_route = argparse.ArgumentParser(add_help=False)
+    pre_route.add_argument("--route", choices=["acc","gyr","vis","gns"], default=None)
+    args_route, _ = pre_route.parse_known_args()
+    
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=str, default=None, help="YAML/JSON 配置文件")
+    args_pre, _ = pre.parse_known_args()
+
+    # 加载配置文件
+    cfg = load_config_file(args_pre.config) if args_pre.config else {}
+    
+    # 根据 --route 参数读取对应的配置段
+    route = args_route.route
+    if route == "gns" and args_pre.config:
+        ev = cfg.get("eval_gns", cfg.get("eval", {}))
+        an = cfg.get("analyze_gns", cfg.get("analyze", {}))
+    else:
+        ev = cfg.get("eval", {})
+        an = cfg.get("analyze", {})
+    rt = cfg.get("runtime", {})
+
+    ap = argparse.ArgumentParser("Save diagnostics plots for a single-route model", parents=[pre])
+    ap.add_argument("--route", choices=["acc","gyr","vis","gns"], 
+                    required=(route is None), default=route or ev.get("route"))
+    ap.add_argument("--npz", required=(ev.get("npz") is None), default=ev.get("npz"))
+    ap.add_argument("--model", required=(ev.get("model") is None), default=ev.get("model"))
+    ap.add_argument("--x_mode", choices=["both","route_only"], default=ev.get("x_mode", "both"))
+    ap.add_argument("--out", required=(an.get("out") is None), default=an.get("out"))
+    ap.add_argument("--device", default=rt.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+    ap.add_argument("--use_loglog", action="store_true", default=an.get("use_loglog", False),
+                    help="使用对数坐标散点图（推荐）")
+    ap.add_argument("--nu", type=float, default=0.0, help="Student-t 自由度（作图口径）；0 表示只画高斯口径")
+    ap.add_argument("--post_scale_json", type=str, default=None, help="评图时应用按轴温度缩放 JSON")
     return ap.parse_args()
+
+def _t_thr(nu, coverages=(0.68,0.95)):
+    if not (nu and nu>2.0): 
+        return {}
+    import torch
+    t = torch.distributions.StudentT(df=nu)
+    th = {}
+    for p in coverages:
+        q = float(t.icdf(torch.tensor([(1+p)/2.0]))[0])
+        th[p] = q*q  # z2 阈值
+    return th
+
+def _apply_post_scale(logv: torch.Tensor, c_axis: torch.Tensor | None) -> torch.Tensor:
+    if c_axis is None:
+        return logv
+    return logv + c_axis.log().view(1,1,-1).to(logv.device, logv.dtype)
 
 def main():
     args = parse_args()
@@ -49,10 +91,22 @@ def main():
     model.load_state_dict(ckpt["model"])
     model.to(args.device).eval()
 
+    # 载入post_scale（可选）
+    c_axis = None
+    if args.post_scale_json:
+        import json
+        js = json.loads(Path(args.post_scale_json).read_text())
+        c_axis = torch.tensor(js["c_axis"], dtype=torch.float32, device=args.device)
+
     with torch.no_grad():
         batch = next(iter(dl))
         batch = to_device(batch, args.device)
         logv = model(batch["X"])
+        
+        # 应用post_scale（如果有）
+        if c_axis is not None and args.route == "gns":
+            logv = _apply_post_scale(logv, c_axis)
+            
         if args.route == "vis":
             df = 2.0
         else:
@@ -66,6 +120,12 @@ def main():
             e2_axes  = batch["E2_AXES"]                     # (B,T,3)
             m_axes   = batch["MASK_AXES"].float()           # (B,T,3)
             z2_axes  = e2_axes / torch.clamp(var_axes, 1e-12)
+            
+            # 为每个轴分别提取z2数据
+            z2_E = z2_axes[:,:,0][m_axes[:,:,0] > 0.5].detach().cpu().numpy()
+            z2_N = z2_axes[:,:,1][m_axes[:,:,1] > 0.5].detach().cpu().numpy()
+            z2_U = z2_axes[:,:,2][m_axes[:,:,2] > 0.5].detach().cpu().numpy()
+            
             mask_flat = (m_axes > 0.5)
             z2_np = z2_axes[mask_flat].detach().cpu().numpy().reshape(-1)
         else:
@@ -86,73 +146,136 @@ def main():
             z2_np = z2[mask_flat].detach().cpu().numpy().reshape(-1)
 
         # Plot 1: histogram of z^2
-        # GNSS使用逐轴1D z²，显示df=1；其他路由按原df
-        hist_df = 1 if args.route == "gns" else int(df)
-        plt.figure()
-        plt.hist(z2_np, bins=100)
-        plt.title(f"z^2 (df={hist_df}) - route={args.route}")
-        plt.xlabel("z^2")
-        plt.ylabel("count")
-        plt.tight_layout()
-        plt.savefig(os.path.join(args.out, "hist_z2.png"))
-        plt.close()
+        if args.route == "gns":
+            # GNSS: 为每个轴绘制直方图，支持t口径和高斯口径对照
+            thr_t = _t_thr(args.nu)
+            thr_g = {0.68:1.0, 0.95:3.841}
+            
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            for axis_name, z2_vec, ax in zip(["E","N","U"], [z2_E, z2_N, z2_U], axes):
+                ax.hist(z2_vec, bins=100, alpha=0.6, density=True)
+                
+                # t口径阈值线（如果有）
+                if thr_t:
+                    for p,v in thr_t.items(): 
+                        cov_t = np.mean(z2_vec <= v)
+                        ax.axvline(v, linestyle="--", label=f"t(ν={args.nu}) {int(p*100)}%: {cov_t:.3f}")
+                
+                # 高斯口径阈值线
+                for p,v in thr_g.items(): 
+                    cov_g = np.mean(z2_vec <= v)
+                    ax.axvline(v, linestyle=":", label=f"Gaussian {int(p*100)}%: {cov_g:.3f}")
+                
+                ax.set_title(f"{axis_name}: z^2 histogram (t & Gaussian thresholds)")
+                ax.set_xlabel("z^2"); ax.set_ylabel("density"); ax.legend(); ax.grid(True, alpha=0.3)
+            
+            plt.suptitle("GNSS z^2 Histograms with Coverage Thresholds")
+            plt.tight_layout()
+            plt.savefig(os.path.join(args.out, "hist_z2.png"))
+            plt.close()
+        else:
+            # 其他路由：原有逻辑
+            hist_df = int(df)
+            plt.figure()
+            plt.hist(z2_np, bins=100)
+            plt.title(f"z^2 (df={hist_df}) - route={args.route}")
+            plt.xlabel("z^2")
+            plt.ylabel("count")
+            plt.tight_layout()
+            plt.savefig(os.path.join(args.out, "hist_z2.png"))
+            plt.close()
 
         # Plot 2: scatter err^2 vs var
         if args.use_loglog:
             # 对数散点图：逐窗口散点 + 对数坐标
             if args.route == "gns":
+                # GNSS: 为每个轴分别绘制散点图
                 m = m_axes.reshape(-1, m_axes.shape[-1])      # (B*T,3)
                 e2_flat = e2_axes.reshape(-1, e2_axes.shape[-1])
                 var_flat = var_axes.reshape(-1, var_axes.shape[-1])
+                
+                axis_names = ['E', 'N', 'U']
+                fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+                
+                for i, (ax, axis_name) in enumerate(zip(axes, axis_names)):
+                    # 每个轴单独处理
+                    valid_mask = m[:, i] > 0.5
+                    e2_axis = e2_flat[valid_mask, i].detach().cpu().numpy()
+                    var_axis = var_flat[valid_mask, i].detach().cpu().numpy()
+                    
+                    ax.scatter(e2_axis, var_axis, s=4, alpha=0.4)
+                    ax.set_xscale('log'); ax.set_yscale('log')
+                    ax.set_xlabel(f'err^2 ({axis_name} axis)')
+                    ax.set_ylabel(f'pred var ({axis_name} axis)')
+                    ax.set_title(f'{axis_name} Axis')
+                    ax.grid(True, alpha=0.3)
+                
+                plt.suptitle(f'GNSS Scatter (per-axis, log-log) - route={args.route}')
+                plt.tight_layout()
+                plt.savefig(os.path.join(args.out, "scatter_err2_vs_var_loglog.png"))
+                plt.close()
             else:
+                # 其他路由：单轴处理
                 m = mask.reshape(-1, mask.shape[-1])          # (B*T,1)
                 e2_flat = e2sum.reshape(-1, e2sum.shape[-1])
                 var_flat = var.reshape(-1, var.shape[-1])
-            
-            # 应用mask过滤
-            valid_mask = m > 0.5
-            e2_valid = e2_flat[valid_mask]
-            var_valid = var_flat[valid_mask]
-            
-            # 多维（GNSS 3轴）取逐轴平均合成一个散点
-            if e2_valid.dim() > 1 and e2_valid.shape[-1] > 1:
-                e2s = e2_valid.mean(dim=-1)
-                vps = var_valid.mean(dim=-1)
-            else:
+                
+                # 应用mask过滤
+                valid_mask = m > 0.5
+                e2_valid = e2_flat[valid_mask]
+                var_valid = var_flat[valid_mask]
+                
                 e2s = e2_valid.squeeze(-1) if e2_valid.dim() > 1 else e2_valid
                 vps = var_valid.squeeze(-1) if var_valid.dim() > 1 else var_valid
-            
-            e2s_np = e2s.detach().cpu().numpy()
-            vps_np = vps.detach().cpu().numpy()
-            
-            plt.figure()
-            plt.scatter(e2s_np, vps_np, s=6, alpha=0.35)
-            plt.xscale('log'); plt.yscale('log')  # 关键：对数坐标
-            plt.xlabel('err^2 (per-window, pooled)')
-            plt.ylabel('pred var')
-            plt.title(f'Scatter (per-window, log-log) - route={args.route}')
-            plt.tight_layout()
-            plt.savefig(os.path.join(args.out, "scatter_err2_vs_var_loglog.png"))
-            plt.close()
+                
+                e2s_np = e2s.detach().cpu().numpy()
+                vps_np = vps.detach().cpu().numpy()
+                
+                plt.figure()
+                plt.scatter(e2s_np, vps_np, s=6, alpha=0.35)
+                plt.xscale('log'); plt.yscale('log')  # 关键：对数坐标
+                plt.xlabel('err^2 (per-window, pooled)')
+                plt.ylabel('pred var')
+                plt.title(f'Scatter (per-window, log-log) - route={args.route}')
+                plt.tight_layout()
+                plt.savefig(os.path.join(args.out, "scatter_err2_vs_var_loglog.png"))
+                plt.close()
         else:
             # 原始散点图
             if args.route == "gns":
-                # GNSS: 使用逐轴数据，取平均聚合
-                es = e2_axes[mask_flat].mean(dim=-1).detach().cpu().numpy().reshape(-1)
-                vv = var_axes[mask_flat].mean(dim=-1).detach().cpu().numpy().reshape(-1)
+                # GNSS: 为每个轴分别绘制散点图
+                axis_names = ['E', 'N', 'U']
+                fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+                
+                for i, (ax, axis_name) in enumerate(zip(axes, axis_names)):
+                    # 每个轴单独处理
+                    valid_mask = m_axes[:, :, i] > 0.5
+                    e2_axis = e2_axes[valid_mask, i].detach().cpu().numpy()
+                    var_axis = var_axes[valid_mask, i].detach().cpu().numpy()
+                    
+                    ax.scatter(e2_axis, var_axis, s=4, alpha=0.5)
+                    ax.set_xlabel(f'err^2 ({axis_name} axis)')
+                    ax.set_ylabel(f'pred var ({axis_name} axis)')
+                    ax.set_title(f'{axis_name} Axis')
+                    ax.grid(True, alpha=0.3)
+                
+                plt.suptitle(f'GNSS Scatter (per-axis) - route={args.route}')
+                plt.tight_layout()
+                plt.savefig(os.path.join(args.out, "scatter_err2_vs_var.png"))
+                plt.close()
             else:
                 # 其他路由：使用聚合数据
                 es = e2sum[mask_flat].detach().cpu().numpy().reshape(-1)
                 vv = var[mask_flat].detach().cpu().numpy().reshape(-1)
                 
-            plt.figure()
-            plt.scatter(es, vv, s=4, alpha=0.5)
-            plt.xlabel("pooled err^2")
-            plt.ylabel("pred var")
-            plt.title(f"Scatter pooled err^2 vs var - route={args.route}")
-            plt.tight_layout()
-            plt.savefig(os.path.join(args.out, "scatter_err2_vs_var.png"))
-            plt.close()
+                plt.figure()
+                plt.scatter(es, vv, s=4, alpha=0.5)
+                plt.xlabel("pooled err^2")
+                plt.ylabel("pred var")
+                plt.title(f"Scatter pooled err^2 vs var - route={args.route}")
+                plt.tight_layout()
+                plt.savefig(os.path.join(args.out, "scatter_err2_vs_var.png"))
+                plt.close()
 
         # Plot 3: time series of logvar (first few sequences)
         if args.route == "gns":

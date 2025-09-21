@@ -86,9 +86,9 @@ train_gns:
   
   # 轴感知早停和按轴自适应加权
   early_axis: true                    # 使用"最差轴 |E[z²]-1|"做早停监控
-  axis_auto_balance: false            # 先关；稳定后再按需打开
+  axis_auto_balance: true             # 启用按轴自适应平衡，优化U轴性能
   axis_power: 1.2                     # 稍微增加指数，更强调差异大的轴
-  axis_clip: "0.3,3.0"                # 扩大权重范围，允许更大的自适应调整
+  axis_clip: "0.5,2.0"                # 收紧权重范围，避免过分拉大某轴
   early_patience: 15                  # 增加耐心值
   student_nu: 3.0                     # 启用 Student-t NLL（nu=3）
   
@@ -109,5 +109,13 @@ model_gns:
 eval_gns:
   route: gns
   npz: data_gns/test_gns.npz
-  model: runs/gns_tcn/best.pt
+  model: runs/gns_tcn_fix/best.pt
   x_mode: both
+
+analyze_gns:
+  route: gns
+  npz: data_gns/test_gns.npz
+  model: runs/gns_tcn_fix/best.pt
+  x_mode: both
+  out: plots_gns
+  use_loglog: true

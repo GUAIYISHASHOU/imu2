@@ -171,21 +171,33 @@ def garch_envelope(T, base_en=(0.7,0.7), base_u=1.8,
         r = slice(idx, min(T, idx+L)); g_en[r] = ge; g_u[r] = gu; idx += L
         if idx >= T: break
     if idx < T: g_en[idx:] = scene_gain_en[-1]; g_u[idx:] = scene_gain_u[-1]
+    # 正确的GARCH递推：场景增益作为基准方差，GARCH递推用无量纲因子
+    uE=uN=uU=1.0   # 无量纲波动因子，稳态均值 ~ 1
     varE = np.zeros(T); varN = np.zeros(T); varU = np.zeros(T)
     varE[0] = (sigE0*g_en[0])**2; varN[0] = (sigN0*g_en[0])**2; varU[0] = (sigU0*g_u[0])**2
     eE_prev=eN_prev=eU_prev=0.0
     rng = np.random.default_rng(seed+123)
+    
     for t in range(1,T):
+        baseE = (sigE0*g_en[t])**2
+        baseN = (sigN0*g_en[t])**2
+        baseU = (sigU0*g_u [t])**2
         if enable:
-            varE[t] = (omega + alpha*(eE_prev**2) + beta*varE[t-1]) * (g_en[t]**2)
-            varN[t] = (omega + alpha*(eN_prev**2) + beta*varN[t-1]) * (g_en[t]**2)
-            varU[t] = (omega + alpha*(eU_prev**2) + beta*varU[t-1]) * (g_u [t]**2)
-            varE[t] = min(varE[t], 1e6); varN[t] = min(varN[t], 1e6); varU[t] = min(varU[t], 1e6)
+            zE = eE_prev / max(np.sqrt(varE[t-1]), 1e-9)
+            zN = eN_prev / max(np.sqrt(varN[t-1]), 1e-9)
+            zU = eU_prev / max(np.sqrt(varU[t-1]), 1e-9)
+            uE = omega + alpha*(zE*zE) + beta*uE   # α+β < 1 即稳定
+            uN = omega + alpha*(zN*zN) + beta*uN
+            uU = omega + alpha*(zU*zU) + beta*uU
         else:
-            varE[t] = (sigE0*g_en[t])**2; varN[t] = (sigN0*g_en[t])**2; varU[t] = (sigU0*g_u[t])**2
-        eE_prev = rng.normal(0.0, math.sqrt(varE[t]))
-        eN_prev = rng.normal(0.0, math.sqrt(varN[t]))
-        eU_prev = rng.normal(0.0, math.sqrt(varU[t]))
+            uE=uN=uU=1.0
+        varE[t] = baseE * uE
+        varN[t] = baseN * uN
+        varU[t] = baseU * uU
+        # 生成一步残差供下一步标准化
+        eE_prev = rng.normal(0.0, np.sqrt(varE[t]))
+        eN_prev = rng.normal(0.0, np.sqrt(varN[t]))
+        eU_prev = rng.normal(0.0, np.sqrt(varU[t]))
     return np.stack([np.sqrt(varE), np.sqrt(varN), np.sqrt(varU)], axis=-1)
 
 def synth_vendor_std(true_sigma, bias=1.4, ln_jitter=0.2, seed=0):

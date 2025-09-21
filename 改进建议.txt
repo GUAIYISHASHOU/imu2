@@ -1,120 +1,281 @@
-0) 配置：把训练规模与稳健性拉起来（直接覆盖）
-把你的 config.yaml 里 GNSS 段更新为下面这版（如果你的配置是分段结构，按键名合并即可）：
-
-yaml
-Copy
-Edit
-# —— GNSS 训练/评测（route=gns）
-train_gns:
-  route: gns
-  train_npz: data_gns/train_gns.npz
-  val_npz:   data_gns/val_gns.npz
-  test_npz:  data_gns/test_gns.npz
-  run_dir:   runs/gns_tcn_fix
-  epochs: 80
-  batch_size: 64
-  lr: 3e-4
-  x_mode: both
-  seed: 0
-
-  # 方差头边界与校准
-  logv_min: -12
-  logv_max: 6
-  z2_center: 0.02            # ← 从 1e-3 提升到 2e-2
-  z2_center_target: auto     # ← 训练中自动根据 NLL 类型设定目标
-
-  # 轴感知/自适应（先关掉以避免追噪）
-  early_axis: true
-  axis_auto_balance: false
-  early_patience: 15
-  axis_power: 1.2
-  axis_clip: "0.3,3.0"
-
-  # 稳健 NLL（你已支持）：ν>0 切换到 Student-t
-  student_nu: 3.0
-
-  # 新增：逐轴 vendor 软锚（可先设 0 关掉）
-  anchor_axes_weight: 0.0003
-
-  # 新增：验证集温度缩放（自动把 z² 拉回 1）
-  post_scale: true
-
-model_gns:
-  d_model: 96
-  n_tcn: 6
-  kernel_size: 3
-  n_heads: 2
-  n_layers_tf: 1
-  dropout: 0.10
-目的：把稳健性（Student-t + 更强 z² 居中）与数据/模型规模匹配（小一号模型）先对上，后面再逐步恢复更“难”的噪声设定。
-
-1) losses.py：新增“逐轴 vendor 软锚”（可选，但小样本很稳）
-你已经有 nll_studentt_diag_axes 等函数了。现在在 losses.py 里，紧跟它们新增一个逐轴 anchor（把 log-variance 轻微拉向 log(vendor^2)；与现有 mse_anchor_1d 完全同构）：
+1) metrics.py —— 新增工具 + 改造 GNSS 逐轴指标
+直接把下面这段整块粘贴到文件末尾（不影响现有接口）；并把原有的 route_metrics_gns_axes 用这里的同名实现覆盖即可。
 
 python
 Copy
 Edit
-def mse_anchor_axes(logv_axes: torch.Tensor, y_var_axes: torch.Tensor, mask_axes: torch.Tensor, lam: float=1e-4) -> torch.Tensor:
+# ======= append to metrics.py =======
+from typing import Dict, Tuple, List
+
+def _spearman_no_scipy(x: np.ndarray, y: np.ndarray) -> float:
+    if x.size < 3 or y.size < 3:
+        return 0.0
+    rx = np.argsort(np.argsort(x))
+    ry = np.argsort(np.argsort(y))
+    c = np.corrcoef(rx, ry)
+    return float(c[0, 1])
+
+def _student_t_z2_thresholds(nu: float, coverages=(0.68, 0.95)) -> Dict[str, float]:
     """
-    GNSS 逐轴 log-variance 的软锚：把预测 logv 轻微拉向 log(vendor^2)。
-    logv_axes   : (B,T,3)
-    y_var_axes  : (B,T,3)  —— 逐轴 vendor 报告的方差（不是标准差）
-    mask_axes   : (B,T,3)
+    双侧覆盖率阈值：给定 Student-t(ν)，返回 z^2=e^2/var 的阈值（不取 sqrt）。
+    例如 p=0.95 -> |t|<=t_{(1+p)/2}，z2_thresh = t^2
     """
-    lv = logv_axes
-    y  = torch.clamp(y_var_axes, min=1e-12).log()
+    import torch
+    tdist = torch.distributions.StudentT(df=nu)
+    out = {}
+    for p in coverages:
+        q = float(tdist.icdf(torch.tensor([(1.0 + p) / 2.0]))[0])  # 正分位
+        out[f"{int(round(p*100))}"] = q * q
+    return out
+
+def _reliability_by_var(e2: np.ndarray, v: np.ndarray, m: np.ndarray, nbuckets: int = 10) -> dict:
+    mask = (m.reshape(-1) > 0.5)
+    if mask.sum() == 0:
+        return {"bucket_edges": [], "bucket_ez2": [], "bucket_var": [], "bucket_err2": [],
+                "slope": 0.0, "spearman": 0.0}
+    e2 = e2.reshape(-1)[mask]
+    v  = v.reshape(-1)[mask]
+    v  = np.clip(v, 1e-12, None)
+
+    # 分位桶
+    edges = np.quantile(v, np.linspace(0.0, 1.0, nbuckets + 1))
+    idx = np.digitize(v, edges[1:-1], right=True)
+    bucket_ez2, bucket_var, bucket_err2 = [], [], []
+    for b in range(nbuckets):
+        sel = (idx == b)
+        if sel.sum() == 0:
+            bucket_ez2.append(float("nan"))
+            bucket_var.append(float("nan"))
+            bucket_err2.append(float("nan"))
+        else:
+            bucket_ez2.append(float(np.mean(e2[sel] / v[sel])))
+            bucket_var.append(float(np.mean(v[sel])))
+            bucket_err2.append(float(np.mean(e2[sel])))
+
+    # 相关性与斜率：log(err²) ~ a*log(var)+b
+    X = np.log(v)
+    Y = np.log(np.clip(e2, 1e-18, None))
+    A = np.vstack([X, np.ones_like(X)]).T
+    a, b = np.linalg.lstsq(A, Y, rcond=None)[0]  # slope, intercept
+    spearman = _spearman_no_scipy(X, Y)
+
+    return {
+        "bucket_edges": [float(e) for e in edges],
+        "bucket_ez2": bucket_ez2,
+        "bucket_var": bucket_var,
+        "bucket_err2": bucket_err2,
+        "slope": float(a),
+        "spearman": float(spearman),
+    }
+
+@torch.no_grad()
+def route_metrics_gns_axes(e2_axes: torch.Tensor, logv_axes: torch.Tensor, mask_axes: torch.Tensor,
+                           logv_min: float, logv_max: float, nu: float = 0.0) -> dict:
+    """
+    GNSS 各向异性评测（逐轴）：统一 t 口径 + 高斯口径对照，并输出可靠性曲线。
+    - e2_axes: (B,T,3) 逐轴误差平方（ENU）
+    - logv_axes: (B,T,3) 逐轴 log(var)
+    - mask_axes: (B,T,3)
+    """
+    lv = torch.clamp(logv_axes, min=logv_min, max=logv_max)
+    v  = torch.clamp(torch.exp(lv), min=1e-12)
     m  = mask_axes.float()
-    se = (lv - y)**2 * m
-    return lam * se.sum() / torch.clamp(m.sum(), min=1.0)
-（粘贴到和 mse_anchor_1d 同一文件中即可。）
+    z2 = (e2_axes / v)  # 1D z²
+    den = m.sum(dim=(0,1)).clamp_min(1.0)  # (3,)
 
-2) train.py：三处小改动（全部可直接贴）
-你当前的 train.py 已经：
-
-解析了 --student_nu，并在 GNSS 分支使用了 nll_studentt_diag_axes；
-
-做了 z² 居中正则；
-
-打印 NLL=...；
-这些都很好。现在再做三件事：
-
-2.1 解析两个新参数
-在现有 argparse 段落添加两个参数（紧跟其它训练超参后即可）：
-
-python
-Copy
-Edit
-ap.add_argument("--anchor_axes_weight", type=float, default=tr.get("anchor_axes_weight", 0.0),
-                help="GNSS 逐轴 vendor 软锚权重（0 关闭）")
-ap.add_argument("--post_scale", action="store_true", default=tr.get("post_scale", False),
-                help="在验证集上做一次温度缩放，把 z² 拉回 1")
-这样就能从配置里直接控制“逐轴软锚”和“温度缩放”。
-
-2.2 训练时（仅 GNSS）接入“逐轴 vendor 软锚”
-在 GNSS 的 loss 分支追加（就在你计算完 loss、进入 z² 居中之前）：
-
-python
-Copy
-Edit
-# —— GNSS 逐轴 vendor 软锚（可选）
-if args.route == "gns" and args.anchor_axes_weight > 0 and ("VENDOR_VAR_AXES" in batch):
-    loss = loss + args.anchor_axes_weight * \
-           mse_anchor_axes(logv, batch["VENDOR_VAR_AXES"], batch["MASK_AXES"])
-其中 batch["VENDOR_VAR_AXES"] 是 (B,T,3) 的方差（不是标准差）。如果你的 Dataset 里还没有提供它，可以先把 anchor_axes_weight 设为 0，训练流程不受影响。
-
-2.3 让 z² 居中“自动目标值”支持 Student-t
-你代码里已经写了注释“若是 Student-t 则 nu/(nu-2)”，现在把它真正实现：把 z² 居中的这段修改为（仅替换 if args.z2_center > 0: 里面“目标值”计算的几行）：
-
-python
-Copy
-Edit
-# 目标值：高斯=1；若使用 Student-t 且 ν>2，则 target=ν/(ν-2)
-if args.z2_center_target == "auto":
-    if args.student_nu and args.student_nu > 2.0:
-        target = args.student_nu / (args.student_nu - 2.0)
+    # —— t 口径（若 nu>2）——
+    out = {}
+    if nu and nu > 2.0:
+        target = float(nu / (nu - 2.0))  # E[t^2]
+        thr_t = _student_t_z2_thresholds(nu, coverages=(0.68, 0.95))
+        z2_mean_raw = (z2 * m).sum(dim=(0,1)) / den                       # (3,)
+        z2_mean_norm = z2_mean_raw / target                                # (3,)
+        cov68_t = ((z2 <= thr_t["68"]).float() * m).sum(dim=(0,1)) / den
+        cov95_t = ((z2 <= thr_t["95"]).float() * m).sum(dim=(0,1)) / den
+        out.update({
+            "t_nu": nu,
+            "t_target": target,
+            "z2_mean_raw": z2_mean_raw.detach().cpu().tolist(),
+            "z2_mean_norm": z2_mean_norm.detach().cpu().tolist(),
+            "cov68_t": cov68_t.detach().cpu().tolist(),
+            "cov95_t": cov95_t.detach().cpu().tolist(),
+            "t_z2_thr68": thr_t["68"],
+            "t_z2_thr95": thr_t["95"],
+        })
     else:
-        target = 1.0
-else:
-    target = float(args.z2_center_target)
-这样在 student_nu=3.0 时，目标会自动设为 3/(3-2)=3.0，配合 t-NLL 让 z² 的统计量自然落在合理区间。
+        target = 1.0  # 回落到高斯口径
 
+    # —— 高斯口径对照（χ² df=1）——
+    cov68_g = ((z2 <= 1.0).float() * m).sum(dim=(0,1)) / den
+    cov95_g = ((z2 <= 3.841).float() * m).sum(dim=(0,1)) / den
+    z2_mean = (z2 * m).sum(dim=(0,1)) / den
+    out.update({
+        "z2_mean_gauss": z2_mean.detach().cpu().tolist(),
+        "cov68_g": cov68_g.detach().cpu().tolist(),
+        "cov95_g": cov95_g.detach().cpu().tolist(),
+    })
+
+    # —— 可靠性曲线（分桶） —— 
+    e2_np = e2_axes.detach().cpu().numpy()
+    v_np  = v.detach().cpu().numpy()
+    m_np  = m.detach().cpu().numpy()
+    rel = [_reliability_by_var(e2_np[...,i], v_np[...,i], m_np[...,i], nbuckets=10) for i in range(e2_np.shape[-1])]
+    out["reliability"] = rel  # list of dicts per axis
+
+    return out
+# ======= end append =======
+兼容性：我们保留了函数名 route_metrics_gns_axes，并在参数末尾加了 nu: float=0.0 的默认值，所以训练侧如果仍旧按 5 个参数调用不会报错。
+
+2) eval.py —— 新增参数 + 支持估计/加载 post_scale + 输出双口径指标和可靠性
+把下列三处改动贴进去（均为独立可搜索锚点，便于你直接替换）。
+
+2.1 参数解析（在 parse_args() 里补充）
+python
+Copy
+Edit
+# 增加在 ap.add_argument(...) 列表末尾
+ap.add_argument("--nu", type=float, default=0.0, help="Student-t 自由度（评测口径）；0 表示用高斯口径")
+ap.add_argument("--post_scale_json", type=str, default=None, help="按轴温度缩放系数 JSON（评测时应用）")
+ap.add_argument("--est_post_scale_from", type=str, default=None, help="从此 npz（一般是val集）估计按轴温度缩放")
+ap.add_argument("--save_post_scale_to", type=str, default=None, help="把估计的缩放系数保存到 JSON")
+备注：如果你希望默认跟随 ckpt 中保存的 student_nu，也可以在加载模型参数后将 args.nu 设为 md_args.get("student_nu", 0.0)。
+
+2.2 工具函数（在 main() 前加）
+python
+Copy
+Edit
+def _apply_post_scale(logv: torch.Tensor, c_axis: torch.Tensor | None) -> torch.Tensor:
+    if c_axis is None:
+        return logv
+    return logv + c_axis.log().view(1,1,-1).to(logv.device, logv.dtype)
+
+@torch.no_grad()
+def _estimate_post_scale_gns_axes(model, dl, device, logv_min, logv_max, nu: float) -> torch.Tensor:
+    """在验证集估 c_axis = E[z²]/target（target=t:nu/(nu-2), 否则=1）"""
+    num = torch.zeros(3, device=device)
+    den = torch.zeros(3, device=device)
+    target = nu/(nu-2.0) if (nu and nu>2.0) else 1.0
+    for batch in dl:
+        b = to_device(batch, device)
+        logv = model(b["X"])
+        lv = torch.clamp(logv, min=logv_min, max=logv_max)
+        v  = torch.exp(lv).clamp_min(1e-12)
+        e2 = b["E2_AXES"]; m = b["MASK_AXES"].float()
+        z2 = e2 / v
+        num += (z2 * m).sum(dim=(0,1))
+        den += m.sum(dim=(0,1)).clamp_min(1.0)
+    ez2 = num / den
+    c = (ez2 / target).clamp_min(1e-6)  # (3,)
+    return c.detach()
+2.3 主流程中应用（替换 GNSS 分支的评测汇总）
+把你当前 eval.py 里 “GNSS逐维分析（汇总所有批次）” 那个大段替换为下面这段（会同时输出 per_axis.json 和 reliability.json 到同目录）：
+
+python
+Copy
+Edit
+# ==== GNSS逐维分析（支持t口径+post_scale）====
+if args.route == "gns":
+    import numpy as np, json
+    # —— 可选：从 val 集估计 post_scale 并存盘 ——
+    c_axis = None
+    if args.est_post_scale_from:
+        ds_val, dl_val = build_loader(args.est_post_scale_from, route="gns", x_mode=args.x_mode,
+                                      batch_size=64, shuffle=False, num_workers=0)
+        c_axis = _estimate_post_scale_gns_axes(model, dl_val, args.device,
+                                               md_args.get("logv_min",-12.0),
+                                               md_args.get("logv_max",6.0),
+                                               args.nu)
+        if args.save_post_scale_to:
+            Path(args.save_post_scale_to).write_text(json.dumps({
+                "axis": ["E","N","U"], "c_axis": c_axis.cpu().tolist(),
+                "nu": args.nu, "target": (args.nu/(args.nu-2.0) if (args.nu and args.nu>2.0) else 1.0)
+            }, ensure_ascii=False, indent=2))
+            print("[post_scale] saved to:", args.save_post_scale_to)
+    # —— 可选：从 json 载入 post_scale ——
+    if (c_axis is None) and args.post_scale_json:
+        js = json.loads(Path(args.post_scale_json).read_text())
+        c_axis = torch.tensor(js["c_axis"], dtype=torch.float32, device=args.device)
+
+    # —— 汇总所有批次：注意应用 post_scale 到 logv ——
+    all_e2, all_v, all_m = [], [], []
+    with torch.no_grad():
+        for batch in dl:
+            b = to_device(batch, args.device)
+            logv = model(b["X"])                       # (B,T,3)
+            if c_axis is not None:
+                logv = _apply_post_scale(logv, c_axis) # 应用按轴温度缩放
+            lv = torch.clamp(logv, min=md_args.get("logv_min",-12.0), max=md_args.get("logv_max",6.0))
+            var = torch.exp(lv).clamp_min(1e-12)
+            all_e2.append(b["E2_AXES"].cpu()); all_v.append(var.cpu()); all_m.append(b["MASK_AXES"].cpu())
+
+    e2_axes = torch.cat(all_e2, 0); var_axes = torch.cat(all_v, 0); mask_axes = torch.cat(all_m, 0)
+
+    # 指标（t 口径 + 高斯口径对照 + 可靠性）
+    st_axes = route_metrics_gns_axes(e2_axes, var_axes.log(), mask_axes,
+                                     md_args.get("logv_min",-12.0), md_args.get("logv_max",6.0),
+                                     nu=args.nu)
+    # 保存
+    out_dir = Path(args.model).parent
+    (out_dir/"per_axis.json").write_text(json.dumps(st_axes, ensure_ascii=False, indent=2))
+    print("[gns] per-axis metrics saved to", out_dir/"per_axis.json")
+现在 eval.py 会把两种口径都写进 per_axis.json。你的现有版本是只写了 Ez2/cov68/cov95 且覆盖率阈值固定为 1.0/3.841（高斯口径）。
+
+3) analyze.py —— 直方图/覆盖率图：改用 t 口径并输出一份“高斯对照”
+在 parse_args() 里补充两个参数：
+
+python
+Copy
+Edit
+ap.add_argument("--nu", type=float, default=0.0, help="Student-t 自由度（作图口径）；0 表示只画高斯口径")
+ap.add_argument("--post_scale_json", type=str, default=None, help="评图时应用按轴温度缩放 JSON")
+在 GNSS 作图处（原先你计算 z2=e2/var、并画直方图/散点的地方），用如下函数替换阈值与图例标注逻辑：
+
+python
+Copy
+Edit
+def _t_thr(nu, coverages=(0.68,0.95)):
+    if not (nu and nu>2.0): 
+        return {}
+    import torch
+    t = torch.distributions.StudentT(df=nu)
+    th = {}
+    for p in coverages:
+        q = float(t.icdf(torch.tensor([(1+p)/2.0]))[0])
+        th[p] = q*q  # z2 阈值
+    return th
+
+# ... 得到 z2_E/N/U 三个向量后：
+thr_t = _t_thr(args.nu)
+thr_g = {0.68:1.0, 0.95:3.841}
+
+# 直方图：在同一张图里画两种口径的竖线
+for axis_name, z2_vec in zip(["E","N","U"], [z2_E, z2_N, z2_U]):
+    plt.figure(figsize=(6,4))
+    plt.hist(z2_vec, bins=100, alpha=0.6)
+    if thr_t:
+        for p,v in thr_t.items(): plt.axvline(v, linestyle="--", label=f"t(ν={args.nu}) {int(p*100)}%")
+    for p,v in thr_g.items(): plt.axvline(v, linestyle=":", label=f"Gaussian {int(p*100)}%")
+    plt.title(f"{axis_name}: z^2 histogram (t & Gaussian thresholds)")
+    plt.xlabel("z^2"); plt.ylabel("count"); plt.legend(); plt.tight_layout()
+    # 保存到 out 目录
+若你也要把覆盖率数字标注在图例里，可直接用 np.mean(z2_vec <= 阈值) 计算两套数字并拼到 label。
+
+4) 运行方式（建议）
+bash
+Copy
+Edit
+# 1) 估计并保存按轴温度缩放（用验证集）
+python eval.py --route gns \
+  --npz data_gns/test_gns.npz \
+  --model runs/gns_tcn_fix/best.pt \
+  --x_mode both \
+  --nu 3.0 \
+  --est_post_scale_from data_gns/val_gns.npz \
+  --save_post_scale_to runs/gns_tcn_fix/post_scale.json
+
+# 2) 带着 post_scale + t 口径做评测与作图
+python eval.py --route gns --npz data_gns/test_gns.npz --model runs/gns_tcn_fix/best.pt \
+  --x_mode both --nu 3.0 --post_scale_json runs/gns_tcn_fix/post_scale.json
+
+python analyze.py --route gns --npz data_gns/test_gns.npz --model runs/gns_tcn_fix/best.pt \
+  --x_mode both --out plots_gns --nu 3.0 --post_scale_json runs/gns_tcn_fix/post_scale.json
