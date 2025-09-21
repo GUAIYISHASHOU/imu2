@@ -66,6 +66,49 @@ multi:
   vendor_bias: 1.3                    # 厂商误差偏置
   vendor_ln_jitter: 0.25              # 增加厂商误差的随机性
 
+# —— VIS+IMU 双模态数据生成（gen_bicycle_dual_vis.py）
+vis:
+  out: data_vis                       # 输出目录
+  seed: 42                           # 随机种子
+  traj_duration_s: 600.0             # 轨迹持续时间（秒）
+  rate_hz: 100.0                     # IMU 采样率
+  train_routes: 8                    # 训练路线数
+  val_routes: 2                      # 验证路线数  
+  test_routes: 2                     # 测试路线数
+  
+  # 轨迹可视化
+  plot_trajectories: true            # 生成轨迹概览图
+  plot_individual: false             # 生成单独轨迹图
+  plot_dir: trajectory_plots         # 轨迹图保存目录
+  
+  # 相机参数
+  cam_rate_hz: 20.0                  # 相机帧率
+  img_w: 640                         # 图像宽度
+  img_h: 480                         # 图像高度
+  fx: 400.0                          # 焦距x
+  fy: 400.0                          # 焦距y
+  cx: 320.0                          # 主点x
+  cy: 240.0                          # 主点y
+  
+  # 视觉窗口参数
+  vis_window: 64                     # 视觉窗口大小
+  vis_stride: 32                     # 视觉窗口步长
+  
+  # 噪声参数
+  noise_px: 0.5                      # 像素噪声标准差
+  outlier_ratio: 0.1                 # 外点比例
+  min_match: 12                      # 最小匹配点数
+  
+  # 时变参数
+  noise_tau_s: 0.4                   # 噪声时间常数
+  noise_ln_std: 0.30                 # 噪声对数标准差
+  out_tau_s: 0.6                     # 外点时间常数
+  burst_prob: 0.03                   # 突发概率
+  burst_gain: [0.2, 0.6]             # 突发增益范围
+  motion_k1: 0.8                     # 运动系数1
+  motion_k2: 0.4                     # 运动系数2
+  lp_pool_p: 3.0                     # Lp pooling 参数
+
 # —— GNSS 训练/评测（route=gns）
 train_gns:
   route: gns

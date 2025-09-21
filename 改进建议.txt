@@ -1,281 +1,110 @@
-1) metrics.py —— 新增工具 + 改造 GNSS 逐轴指标
-直接把下面这段整块粘贴到文件末尾（不影响现有接口）；并把原有的 route_metrics_gns_axes 用这里的同名实现覆盖即可。
+改动清单（直接复制）
+1) 在 gen_bicycle_dual_vis.py 顶部 import 引擎
 
-python
-Copy
-Edit
-# ======= append to metrics.py =======
-from typing import Dict, Tuple, List
+在现有 import 区域加一行（位置不限，只要在使用前）：
 
-def _spearman_no_scipy(x: np.ndarray, y: np.ndarray) -> float:
-    if x.size < 3 or y.size < 3:
-        return 0.0
-    rx = np.argsort(np.argsort(x))
-    ry = np.argsort(np.argsort(y))
-    c = np.corrcoef(rx, ry)
-    return float(c[0, 1])
+from engine_builtin import EngineCfg, generate_route as gen_engine
 
-def _student_t_z2_thresholds(nu: float, coverages=(0.68, 0.95)) -> Dict[str, float]:
+2) 用引擎重写 bicycle_traj(...) 函数
+
+在 gen_bicycle_dual_vis.py 里找到你现在的 bicycle_traj(T, dt, seed, ...)（它内部是用正弦造 yaw_rate 和 a_lon 的那段），把整个函数替换为下面这一版。函数签名和返回值完全保持一致（simulate_imu() 无需改）：
+
+def bicycle_traj(
+    T: int, dt: float, seed: int,
+    use_slip: bool = True, use_gravity: bool = True, use_roll_pitch: bool = True,
+    bank_gain: float = 1.0, pitch_gain: float = 1.0,
+    **kw
+):
     """
-    双侧覆盖率阈值：给定 Student-t(ν)，返回 z^2=e^2/var 的阈值（不取 sqrt）。
-    例如 p=0.95 -> |t|<=t_{(1+p)/2}，z2_thresh = t^2
+    以 engine_builtin.py 生成真实/连贯的车辆轨迹，并映射到 IMU 真值（body frame）与 roll/pitch 代理。
+    返回值与旧实现保持一致：acc_true, gyr_true, a_var, g_var, roll, pitch, speed
     """
-    import torch
-    tdist = torch.distributions.StudentT(df=nu)
-    out = {}
-    for p in coverages:
-        q = float(tdist.icdf(torch.tensor([(1.0 + p) / 2.0]))[0])  # 正分位
-        out[f"{int(round(p*100))}"] = q * q
-    return out
+    import numpy as np
+    rng = np.random.default_rng(seed)
 
-def _reliability_by_var(e2: np.ndarray, v: np.ndarray, m: np.ndarray, nbuckets: int = 10) -> dict:
-    mask = (m.reshape(-1) > 0.5)
-    if mask.sum() == 0:
-        return {"bucket_edges": [], "bucket_ez2": [], "bucket_var": [], "bucket_err2": [],
-                "slope": 0.0, "spearman": 0.0}
-    e2 = e2.reshape(-1)[mask]
-    v  = v.reshape(-1)[mask]
-    v  = np.clip(v, 1e-12, None)
+    # === 1) 调引擎生成路况 ===
+    # 你也可以把这些参数做成 CLI / 配置，此处给出合理默认
+    eng_cfg = EngineCfg(
+        dt=dt, T=T, seed=seed,
+        v_max=kw.get("eng_v_max", 20.0),       # m/s
+        a_lon_max=kw.get("eng_a_lon_max", 2.5),
+        a_lat_max=kw.get("eng_a_lat_max", 4.0),
+        delta_max=kw.get("eng_delta_max", 0.5),       # ~28.6°
+        ddelta_max=kw.get("eng_ddelta_max", 0.6),     # rad/s
+        tau_delta=kw.get("eng_tau_delta", 0.25),
+        sigma_max=kw.get("eng_sigma_max", 0.30),
+        jerk_lat_max=kw.get("eng_jerk_lat_max", 6.0),
+        grade_std=kw.get("eng_grade_std", 0.01),
+    )
+    route = gen_engine(eng_cfg)  # dict: t,x,y,z,yaw,v,kappa,a_lat,a_lon,jerk
 
-    # 分位桶
-    edges = np.quantile(v, np.linspace(0.0, 1.0, nbuckets + 1))
-    idx = np.digitize(v, edges[1:-1], right=True)
-    bucket_ez2, bucket_var, bucket_err2 = [], [], []
-    for b in range(nbuckets):
-        sel = (idx == b)
-        if sel.sum() == 0:
-            bucket_ez2.append(float("nan"))
-            bucket_var.append(float("nan"))
-            bucket_err2.append(float("nan"))
-        else:
-            bucket_ez2.append(float(np.mean(e2[sel] / v[sel])))
-            bucket_var.append(float(np.mean(v[sel])))
-            bucket_err2.append(float(np.mean(e2[sel])))
+    # === 2) 提取真值并构造 IMU 量 ===
+    yaw = route["yaw"].astype(np.float32)           # 航向（世界系）
+    v   = route["v"].astype(np.float32)             # 速度
+    a_lon = route["a_lon"].astype(np.float32)       # 纵向加速度（世界->此处当作车体系 x）
+    a_lat = route["a_lat"].astype(np.float32)       # 横向加速度（世界->此处当作车体系 y）
 
-    # 相关性与斜率：log(err²) ~ a*log(var)+b
-    X = np.log(v)
-    Y = np.log(np.clip(e2, 1e-18, None))
-    A = np.vstack([X, np.ones_like(X)]).T
-    a, b = np.linalg.lstsq(A, Y, rcond=None)[0]  # slope, intercept
-    spearman = _spearman_no_scipy(X, Y)
+    # 真值陀螺：仅 z 轴（平面运动假设）
+    yaw_rate = np.diff(yaw, prepend=yaw[:1]) / dt
+    gyr_true = np.stack([
+        np.zeros_like(yaw_rate, dtype=np.float32),
+        np.zeros_like(yaw_rate, dtype=np.float32),
+        yaw_rate.astype(np.float32)
+    ], axis=-1)
 
-    return {
-        "bucket_edges": [float(e) for e in edges],
-        "bucket_ez2": bucket_ez2,
-        "bucket_var": bucket_var,
-        "bucket_err2": bucket_err2,
-        "slope": float(a),
-        "spearman": float(spearman),
-    }
+    # 真值加计（先不含重力；稍后按需减重力投影）
+    ax = a_lon
+    ay = a_lat
+    az = np.zeros_like(ax, dtype=np.float32)
+    acc_true = np.stack([ax, ay, az], axis=-1).astype(np.float32)
 
-@torch.no_grad()
-def route_metrics_gns_axes(e2_axes: torch.Tensor, logv_axes: torch.Tensor, mask_axes: torch.Tensor,
-                           logv_min: float, logv_max: float, nu: float = 0.0) -> dict:
-    """
-    GNSS 各向异性评测（逐轴）：统一 t 口径 + 高斯口径对照，并输出可靠性曲线。
-    - e2_axes: (B,T,3) 逐轴误差平方（ENU）
-    - logv_axes: (B,T,3) 逐轴 log(var)
-    - mask_axes: (B,T,3)
-    """
-    lv = torch.clamp(logv_axes, min=logv_min, max=logv_max)
-    v  = torch.clamp(torch.exp(lv), min=1e-12)
-    m  = mask_axes.float()
-    z2 = (e2_axes / v)  # 1D z²
-    den = m.sum(dim=(0,1)).clamp_min(1.0)  # (3,)
+    # roll/pitch 代理：由横/纵向加速度估计（小角近似）
+    g = 9.81
+    roll  = (bank_gain  * (a_lat / g)).astype(np.float32)   # 左右倾角 ~ 侧向加速度/g
+    pitch = (-pitch_gain * (a_lon / g)).astype(np.float32)  # 俯仰 ~ 纵向加速度/g（前加速为低头）
 
-    # —— t 口径（若 nu>2）——
-    out = {}
-    if nu and nu > 2.0:
-        target = float(nu / (nu - 2.0))  # E[t^2]
-        thr_t = _student_t_z2_thresholds(nu, coverages=(0.68, 0.95))
-        z2_mean_raw = (z2 * m).sum(dim=(0,1)) / den                       # (3,)
-        z2_mean_norm = z2_mean_raw / target                                # (3,)
-        cov68_t = ((z2 <= thr_t["68"]).float() * m).sum(dim=(0,1)) / den
-        cov95_t = ((z2 <= thr_t["95"]).float() * m).sum(dim=(0,1)) / den
-        out.update({
-            "t_nu": nu,
-            "t_target": target,
-            "z2_mean_raw": z2_mean_raw.detach().cpu().tolist(),
-            "z2_mean_norm": z2_mean_norm.detach().cpu().tolist(),
-            "cov68_t": cov68_t.detach().cpu().tolist(),
-            "cov95_t": cov95_t.detach().cpu().tolist(),
-            "t_z2_thr68": thr_t["68"],
-            "t_z2_thr95": thr_t["95"],
-        })
-    else:
-        target = 1.0  # 回落到高斯口径
+    if use_gravity:
+        # 将重力从 body 加速度中扣除：body系下的重力投影（小角近似下也可）
+        c_r, s_r = np.cos(roll), np.sin(roll)
+        c_p, s_p = np.cos(pitch), np.sin(pitch)
+        gx_b = -g * s_p
+        gy_b =  g * s_r
+        gz_b =  g * (c_p * np.cos(roll))  # 小角可近似为 g
+        grav = np.stack([gx_b, gy_b, gz_b], axis=-1).astype(np.float32)
+        acc_true = acc_true - grav
 
-    # —— 高斯口径对照（χ² df=1）——
-    cov68_g = ((z2 <= 1.0).float() * m).sum(dim=(0,1)) / den
-    cov95_g = ((z2 <= 3.841).float() * m).sum(dim=(0,1)) / den
-    z2_mean = (z2 * m).sum(dim=(0,1)) / den
-    out.update({
-        "z2_mean_gauss": z2_mean.detach().cpu().tolist(),
-        "cov68_g": cov68_g.detach().cpu().tolist(),
-        "cov95_g": cov95_g.detach().cpu().tolist(),
-    })
+    # === 3) 传感器噪声方差轨迹（保持与旧版相近的“随运动强度变化”的日程） ===
+    # 你可以替换为原函数里的 schedule；这里给一个稳定且与运动强度相关的示例
+    v_eps = np.clip(v / (np.max(v)+1e-6), 0.0, 1.0)
+    w_eps = np.clip(np.abs(yaw_rate) / (np.max(np.abs(yaw_rate))+1e-6), 0.0, 1.0)
+    a_var = (0.03 + 0.02 * v_eps)**2     # 加计 ~ 速度越快噪声略增
+    g_var = (0.002 + 0.002 * w_eps)**2   # 陀螺 ~ 转向越猛噪声略增
 
-    # —— 可靠性曲线（分桶） —— 
-    e2_np = e2_axes.detach().cpu().numpy()
-    v_np  = v.detach().cpu().numpy()
-    m_np  = m.detach().cpu().numpy()
-    rel = [_reliability_by_var(e2_np[...,i], v_np[...,i], m_np[...,i], nbuckets=10) for i in range(e2_np.shape[-1])]
-    out["reliability"] = rel  # list of dicts per axis
+    speed = v.astype(np.float32)
+    return acc_true, gyr_true, a_var.astype(np.float32), g_var.astype(np.float32), roll, pitch, speed
 
-    return out
-# ======= end append =======
-兼容性：我们保留了函数名 route_metrics_gns_axes，并在参数末尾加了 nu: float=0.0 的默认值，所以训练侧如果仍旧按 5 个参数调用不会报错。
 
-2) eval.py —— 新增参数 + 支持估计/加载 post_scale + 输出双口径指标和可靠性
-把下列三处改动贴进去（均为独立可搜索锚点，便于你直接替换）。
+注：
 
-2.1 参数解析（在 parse_args() 里补充）
-python
-Copy
-Edit
-# 增加在 ap.add_argument(...) 列表末尾
-ap.add_argument("--nu", type=float, default=0.0, help="Student-t 自由度（评测口径）；0 表示用高斯口径")
-ap.add_argument("--post_scale_json", type=str, default=None, help="按轴温度缩放系数 JSON（评测时应用）")
-ap.add_argument("--est_post_scale_from", type=str, default=None, help="从此 npz（一般是val集）估计按轴温度缩放")
-ap.add_argument("--save_post_scale_to", type=str, default=None, help="把估计的缩放系数保存到 JSON")
-备注：如果你希望默认跟随 ckpt 中保存的 student_nu，也可以在加载模型参数后将 args.nu 设为 md_args.get("student_nu", 0.0)。
+这个实现严格遵守了旧版 bicycle_traj(...) 的返回 7 元组接口，因此 simulate_imu(...)、视觉端 make_splits(...) 等调用不需要任何修改。
 
-2.2 工具函数（在 main() 前加）
-python
-Copy
-Edit
-def _apply_post_scale(logv: torch.Tensor, c_axis: torch.Tensor | None) -> torch.Tensor:
-    if c_axis is None:
-        return logv
-    return logv + c_axis.log().view(1,1,-1).to(logv.device, logv.dtype)
+视觉端依旧通过 simulate_imu(...) 里“用无噪声陀螺积分得到 yaw_true，再用 speed 沿该航向积分得到 xy_true”来布置相机位姿，和引擎的 yaw/v 保持一致。
 
-@torch.no_grad()
-def _estimate_post_scale_gns_axes(model, dl, device, logv_min, logv_max, nu: float) -> torch.Tensor:
-    """在验证集估 c_axis = E[z²]/target（target=t:nu/(nu-2), 否则=1）"""
-    num = torch.zeros(3, device=device)
-    den = torch.zeros(3, device=device)
-    target = nu/(nu-2.0) if (nu and nu>2.0) else 1.0
-    for batch in dl:
-        b = to_device(batch, device)
-        logv = model(b["X"])
-        lv = torch.clamp(logv, min=logv_min, max=logv_max)
-        v  = torch.exp(lv).clamp_min(1e-12)
-        e2 = b["E2_AXES"]; m = b["MASK_AXES"].float()
-        z2 = e2 / v
-        num += (z2 * m).sum(dim=(0,1))
-        den += m.sum(dim=(0,1)).clamp_min(1.0)
-    ez2 = num / den
-    c = (ez2 / target).clamp_min(1e-6)  # (3,)
-    return c.detach()
-2.3 主流程中应用（替换 GNSS 分支的评测汇总）
-把你当前 eval.py 里 “GNSS逐维分析（汇总所有批次）” 那个大段替换为下面这段（会同时输出 per_axis.json 和 reliability.json 到同目录）：
+如果你想让视觉端直接用引擎的 x,y 而不是积分复制，可再回到 simulate_imu(...) 里把 xy_true 换成 route['x'],route['y']；当前最小改动不必动那里。
 
-python
-Copy
-Edit
-# ==== GNSS逐维分析（支持t口径+post_scale）====
-if args.route == "gns":
-    import numpy as np, json
-    # —— 可选：从 val 集估计 post_scale 并存盘 ——
-    c_axis = None
-    if args.est_post_scale_from:
-        ds_val, dl_val = build_loader(args.est_post_scale_from, route="gns", x_mode=args.x_mode,
-                                      batch_size=64, shuffle=False, num_workers=0)
-        c_axis = _estimate_post_scale_gns_axes(model, dl_val, args.device,
-                                               md_args.get("logv_min",-12.0),
-                                               md_args.get("logv_max",6.0),
-                                               args.nu)
-        if args.save_post_scale_to:
-            Path(args.save_post_scale_to).write_text(json.dumps({
-                "axis": ["E","N","U"], "c_axis": c_axis.cpu().tolist(),
-                "nu": args.nu, "target": (args.nu/(args.nu-2.0) if (args.nu and args.nu>2.0) else 1.0)
-            }, ensure_ascii=False, indent=2))
-            print("[post_scale] saved to:", args.save_post_scale_to)
-    # —— 可选：从 json 载入 post_scale ——
-    if (c_axis is None) and args.post_scale_json:
-        js = json.loads(Path(args.post_scale_json).read_text())
-        c_axis = torch.tensor(js["c_axis"], dtype=torch.float32, device=args.device)
+可选（把引擎参数做成配置/命令行）
 
-    # —— 汇总所有批次：注意应用 post_scale 到 logv ——
-    all_e2, all_v, all_m = [], [], []
-    with torch.no_grad():
-        for batch in dl:
-            b = to_device(batch, args.device)
-            logv = model(b["X"])                       # (B,T,3)
-            if c_axis is not None:
-                logv = _apply_post_scale(logv, c_axis) # 应用按轴温度缩放
-            lv = torch.clamp(logv, min=md_args.get("logv_min",-12.0), max=md_args.get("logv_max",6.0))
-            var = torch.exp(lv).clamp_min(1e-12)
-            all_e2.append(b["E2_AXES"].cpu()); all_v.append(var.cpu()); all_m.append(b["MASK_AXES"].cpu())
+现在这版把引擎参数写在函数里了。如果你希望像 gen_bicycle_multi.py 那样把引擎参数暴露出来，可以在 argparse 里新增几行，传给 bicycle_traj(..., eng_v_max=..., ...)。例如在 main 里追加：
 
-    e2_axes = torch.cat(all_e2, 0); var_axes = torch.cat(all_v, 0); mask_axes = torch.cat(all_m, 0)
+ap.add_argument("--eng_v_max", type=float, default=20.0)
+ap.add_argument("--eng_a_lat_max", type=float, default=4.0)
+ap.add_argument("--eng_a_lon_max", type=float, default=2.5)
+ap.add_argument("--eng_delta_max", type=float, default=0.5)
+ap.add_argument("--eng_ddelta_max", type=float, default=0.6)
+ap.add_argument("--eng_tau_delta", type=float, default=0.25)
+ap.add_argument("--eng_sigma_max", type=float, default=0.30)
+ap.add_argument("--eng_jerk_lat_max", type=float, default=6.0)
+ap.add_argument("--eng_grade_std", type=float, default=0.01)
 
-    # 指标（t 口径 + 高斯口径对照 + 可靠性）
-    st_axes = route_metrics_gns_axes(e2_axes, var_axes.log(), mask_axes,
-                                     md_args.get("logv_min",-12.0), md_args.get("logv_max",6.0),
-                                     nu=args.nu)
-    # 保存
-    out_dir = Path(args.model).parent
-    (out_dir/"per_axis.json").write_text(json.dumps(st_axes, ensure_ascii=False, indent=2))
-    print("[gns] per-axis metrics saved to", out_dir/"per_axis.json")
-现在 eval.py 会把两种口径都写进 per_axis.json。你的现有版本是只写了 Ez2/cov68/cov95 且覆盖率阈值固定为 1.0/3.841（高斯口径）。
 
-3) analyze.py —— 直方图/覆盖率图：改用 t 口径并输出一份“高斯对照”
-在 parse_args() 里补充两个参数：
-
-python
-Copy
-Edit
-ap.add_argument("--nu", type=float, default=0.0, help="Student-t 自由度（作图口径）；0 表示只画高斯口径")
-ap.add_argument("--post_scale_json", type=str, default=None, help="评图时应用按轴温度缩放 JSON")
-在 GNSS 作图处（原先你计算 z2=e2/var、并画直方图/散点的地方），用如下函数替换阈值与图例标注逻辑：
-
-python
-Copy
-Edit
-def _t_thr(nu, coverages=(0.68,0.95)):
-    if not (nu and nu>2.0): 
-        return {}
-    import torch
-    t = torch.distributions.StudentT(df=nu)
-    th = {}
-    for p in coverages:
-        q = float(t.icdf(torch.tensor([(1+p)/2.0]))[0])
-        th[p] = q*q  # z2 阈值
-    return th
-
-# ... 得到 z2_E/N/U 三个向量后：
-thr_t = _t_thr(args.nu)
-thr_g = {0.68:1.0, 0.95:3.841}
-
-# 直方图：在同一张图里画两种口径的竖线
-for axis_name, z2_vec in zip(["E","N","U"], [z2_E, z2_N, z2_U]):
-    plt.figure(figsize=(6,4))
-    plt.hist(z2_vec, bins=100, alpha=0.6)
-    if thr_t:
-        for p,v in thr_t.items(): plt.axvline(v, linestyle="--", label=f"t(ν={args.nu}) {int(p*100)}%")
-    for p,v in thr_g.items(): plt.axvline(v, linestyle=":", label=f"Gaussian {int(p*100)}%")
-    plt.title(f"{axis_name}: z^2 histogram (t & Gaussian thresholds)")
-    plt.xlabel("z^2"); plt.ylabel("count"); plt.legend(); plt.tight_layout()
-    # 保存到 out 目录
-若你也要把覆盖率数字标注在图例里，可直接用 np.mean(z2_vec <= 阈值) 计算两套数字并拼到 label。
-
-4) 运行方式（建议）
-bash
-Copy
-Edit
-# 1) 估计并保存按轴温度缩放（用验证集）
-python eval.py --route gns \
-  --npz data_gns/test_gns.npz \
-  --model runs/gns_tcn_fix/best.pt \
-  --x_mode both \
-  --nu 3.0 \
-  --est_post_scale_from data_gns/val_gns.npz \
-  --save_post_scale_to runs/gns_tcn_fix/post_scale.json
-
-# 2) 带着 post_scale + t 口径做评测与作图
-python eval.py --route gns --npz data_gns/test_gns.npz --model runs/gns_tcn_fix/best.pt \
-  --x_mode both --nu 3.0 --post_scale_json runs/gns_tcn_fix/post_scale.json
-
-python analyze.py --route gns --npz data_gns/test_gns.npz --model runs/gns_tcn_fix/best.pt \
-  --x_mode both --out plots_gns --nu 3.0 --post_scale_json runs/gns_tcn_fix/post_scale.json
+然后在 make_splits(...) 内部调用 simulate_imu(...) 的地方，把这些 args.eng_* 透传给 bicycle_traj(...) 即可。

@@ -5,7 +5,10 @@ import argparse
 from pathlib import Path
 import json
 import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 from utils import load_config_file
+from engine_builtin import EngineCfg, generate_route as gen_engine
 
 # -------------------- 线性代数小工具 --------------------
 def skew(v):
@@ -24,63 +27,162 @@ def rot_x(roll):
     c,s = np.cos(roll), np.sin(roll)
     return np.array([[1,0,0],[0,c,-s],[0,s,c]], dtype=np.float32)
 
+# -------------------- 轨迹可视化 --------------------
+def plot_trajectory(traj, title="", save_path=None):
+    """绘制单条轨迹的详细信息"""
+    gt_enu = traj["gt_enu"]; t = traj["t"]
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle(title, fontsize=14)
+    # 1. 2D 轨迹
+    axes[0,0].plot(gt_enu[:,0], gt_enu[:,1], 'b-', linewidth=1)
+    axes[0,0].plot(gt_enu[0,0], gt_enu[0,1], 'go', markersize=8, label='Start')
+    axes[0,0].plot(gt_enu[-1,0], gt_enu[-1,1], 'ro', markersize=8, label='End')
+    axes[0,0].set_xlabel('East (m)'); axes[0,0].set_ylabel('North (m)')
+    axes[0,0].set_title('2D Trajectory (E-N)'); axes[0,0].grid(True, alpha=0.3)
+    axes[0,0].legend(); axes[0,0].axis('equal')
+
+    # 2. 高度
+    axes[0,1].plot(t/60, gt_enu[:,2], 'g-', linewidth=1)
+    axes[0,1].set_xlabel('Time (min)'); axes[0,1].set_ylabel('Up (m)')
+    axes[0,1].set_title('Altitude Profile'); axes[0,1].grid(True, alpha=0.3)
+
+    # 3. 速度
+    speed = traj.get("speed", np.zeros(len(t)))
+    axes[1,0].plot(t/60, speed, 'r-', linewidth=1)
+    axes[1,0].set_xlabel('Time (min)'); axes[1,0].set_ylabel('Speed (m/s)')
+    axes[1,0].set_title('Speed Profile'); axes[1,0].grid(True, alpha=0.3)
+
+    # 4. 航向
+    yaw = traj.get("yaw", np.zeros(len(t)))
+    axes[1,1].plot(t/60, np.degrees(yaw), 'purple', linewidth=1)
+    axes[1,1].set_xlabel('Time (min)'); axes[1,1].set_ylabel('Yaw (deg)')
+    axes[1,1].set_title('Heading Profile'); axes[1,1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight'); plt.close()
+    else:
+        plt.show()
+
+def plot_all_trajectories(trajectories, split_name, save_dir):
+    """绘制所有轨迹的概览图"""
+    if not trajectories: return
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    fig.suptitle(f'{split_name.title()} Set Trajectories Overview ({len(trajectories)} routes)', fontsize=16)
+
+    colors = plt.cm.tab10(np.linspace(0, 1, len(trajectories)))
+    # 1. All 2D
+    for i, traj in enumerate(trajectories):
+        gt_enu = traj["gt_enu"]
+        axes[0,0].plot(gt_enu[:,0], gt_enu[:,1], color=colors[i], linewidth=1, label=f'Route {i}', alpha=0.7)
+        axes[0,0].plot(gt_enu[0,0], gt_enu[0,1], 'o', color=colors[i], markersize=6)
+    axes[0,0].set_xlabel('East (m)'); axes[0,0].set_ylabel('North (m)')
+    axes[0,0].set_title('All 2D Trajectories'); axes[0,0].grid(True, alpha=0.3)
+    axes[0,0].legend(bbox_to_anchor=(1.05, 1), loc='upper left'); axes[0,0].axis('equal')
+
+    # 2. 高度
+    for i, traj in enumerate(trajectories):
+        axes[0,1].plot(traj["t"]/60, traj["gt_enu"][:,2], color=colors[i], linewidth=1, alpha=0.7)
+    axes[0,1].set_xlabel('Time (min)'); axes[0,1].set_ylabel('Up (m)')
+    axes[0,1].set_title('Altitude Profiles'); axes[0,1].grid(True, alpha=0.3)
+
+    # 3. 速度
+    for i, traj in enumerate(trajectories):
+        axes[1,0].plot(traj["t"]/60, traj.get("speed", np.zeros(len(traj["t"]))), color=colors[i], linewidth=1, alpha=0.7)
+    axes[1,0].set_xlabel('Time (min)'); axes[1,0].set_ylabel('Speed (m/s)')
+    axes[1,0].set_title('Speed Profiles'); axes[1,0].grid(True, alpha=0.3)
+
+    # 4. 统计
+    stats_text = []
+    for i, traj in enumerate(trajectories):
+        gt_enu = traj["gt_enu"]
+        total_dist = np.sum(np.linalg.norm(np.diff(gt_enu[:,:2], axis=0), axis=1))
+        max_speed = np.max(traj.get("speed", [0])); duration = traj["t"][-1] / 60
+        stats_text.append(f'Route {i}: {total_dist:.1f}m, {max_speed:.1f}m/s, {duration:.1f}min')
+    axes[1,1].text(0.05, 0.95, '\n'.join(stats_text), transform=axes[1,1].transAxes,
+                   fontsize=10, verticalalignment='top', fontfamily='monospace')
+    axes[1,1].set_title('Trajectory Statistics'); axes[1,1].axis('off')
+
+    plt.tight_layout()
+    save_path = Path(save_dir) / f"{split_name}_trajectories_overview.png"
+    plt.savefig(save_path, dpi=150, bbox_inches='tight'); plt.close()
+    print(f"Saved trajectory overview: {save_path}")
+
 # -------------------- 自行车/独轮车轨迹 + IMU 噪声 --------------------
-def bicycle_traj(T: int, dt: float, seed: int,
-                 use_slip=False, use_gravity=True, use_roll_pitch=True,
-                 bank_gain=1.0, pitch_gain=1.0):
+def bicycle_traj(
+    T: int, dt: float, seed: int,
+    use_slip: bool = True, use_gravity: bool = True, use_roll_pitch: bool = True,
+    bank_gain: float = 1.0, pitch_gain: float = 1.0,
+    **kw
+):
+    """
+    以 engine_builtin.py 生成真实/连贯的车辆轨迹，并映射到 IMU 真值（body frame）与 roll/pitch 代理。
+    返回值与旧实现保持一致：acc_true, gyr_true, a_var, g_var, roll, pitch, speed
+    """
+    import numpy as np
     rng = np.random.default_rng(seed)
-    x = y = yaw = 0.0
-    v = 5.0
+
+    # === 1) 调引擎生成路况 ===
+    # 你也可以把这些参数做成 CLI / 配置，此处给出合理默认
+    eng_cfg = EngineCfg(
+        dt=dt, duration_s=T*dt,
+        v_max=kw.get("eng_v_max", 20.0),       # m/s
+        a_lon_max=kw.get("eng_a_lon_max", 2.5),
+        a_lat_max=kw.get("eng_a_lat_max", 4.0),
+        delta_max=kw.get("eng_delta_max", 0.5),       # ~28.6°
+        ddelta_max=kw.get("eng_ddelta_max", 0.6),     # rad/s
+        tau_delta=kw.get("eng_tau_delta", 0.25),
+        sigma_max=kw.get("eng_sigma_max", 0.30),
+        jerk_lat_max=kw.get("eng_jerk_lat_max", 6.0),
+        grade_sigma=(kw.get("eng_grade_std", 0.01), kw.get("eng_grade_std", 0.01)),
+        grade_tau_s=(60.0, 180.0),
+    )
+    route = gen_engine(seed=seed, cfg=eng_cfg)  # dict: t,x,y,z,yaw,v,kappa,a_lat,a_lon,jerk
+
+    # === 2) 提取真值并构造 IMU 量 ===
+    yaw = route["yaw"].astype(np.float32)           # 航向（世界系）
+    v   = route["v"].astype(np.float32)             # 速度
+    a_lon = route["a_lon"].astype(np.float32)       # 纵向加速度（世界->此处当作车体系 x）
+    a_lat = route["a_lat"].astype(np.float32)       # 横向加速度（世界->此处当作车体系 y）
+
+    # 真值陀螺：仅 z 轴（平面运动假设）
+    yaw_rate = np.diff(yaw, prepend=yaw[:1]) / dt
+    gyr_true = np.stack([
+        np.zeros_like(yaw_rate, dtype=np.float32),
+        np.zeros_like(yaw_rate, dtype=np.float32),
+        yaw_rate.astype(np.float32)
+    ], axis=-1)
+
+    # 真值加计（先不含重力；稍后按需减重力投影）
+    ax = a_lon
+    ay = a_lat
+    az = np.zeros_like(ax, dtype=np.float32)
+    acc_true = np.stack([ax, ay, az], axis=-1).astype(np.float32)
+
+    # roll/pitch 代理：由横/纵向加速度估计（小角近似）
     g = 9.81
-
-    acc_true = np.zeros((T,3), np.float32)
-    gyr_true = np.zeros((T,3), np.float32)
-    roll = np.zeros(T, np.float32)
-    pitch= np.zeros(T, np.float32)
-    speed= np.zeros(T, np.float32)
-
-    t = np.arange(T) * dt
-    a_var = 0.20*(1.0 + 0.7*np.sin(0.60*t) + 0.30*rng.normal(size=T))
-    g_var = 0.05*(1.0 + 0.8*np.cos(0.40*t+0.5) + 0.30*rng.normal(size=T))
-    a_var = np.clip(a_var, 1e-5, 5.0).astype(np.float32)
-    g_var = np.clip(g_var, 1e-6, 1.0).astype(np.float32)
-
-    slip = 1.0
-    if use_slip:
-        slip = np.clip(0.9 + 0.1*np.sin(0.003*np.arange(T)), 0.8, 1.1)
-
-    for k in range(T):
-        omega = 0.20*np.sin(0.10*k)             # yaw rate
-        a_cmd = 0.50*np.sin(0.07*k)             # tangential accel
-
-        v = float(np.clip(v + a_cmd*dt, 0.1, 20.0))
-        yaw = yaw + omega*dt
-        x = x + v*np.cos(yaw)*dt
-        y = y + v*np.sin(yaw)*dt
-
-        ax = a_cmd
-        ay = (v*omega) * (slip[k] if isinstance(slip, np.ndarray) else slip)
-        az = 0.0
-
-        # 近似 roll/pitch（小角）：roll≈ay/g, pitch≈-ax/g
-        if use_roll_pitch:
-            roll[k]  = bank_gain  * (ay/g)
-            pitch[k] = -pitch_gain * (ax/g)
-
-        acc_true[k] = [ax,ay,az]
-        gyr_true[k] = [0.0,0.0,omega]
-        speed[k]    = v
+    roll  = (bank_gain  * (a_lat / g)).astype(np.float32)   # 左右倾角 ~ 侧向加速度/g
+    pitch = (-pitch_gain * (a_lon / g)).astype(np.float32)  # 俯仰 ~ 纵向加速度/g（前加速为低头）
 
     if use_gravity:
+        # 将重力从 body 加速度中扣除：body系下的重力投影（小角近似下也可）
         c_r, s_r = np.cos(roll), np.sin(roll)
         c_p, s_p = np.cos(pitch), np.sin(pitch)
         gx_b = -g * s_p
         gy_b =  g * s_r
-        gz_b =  g * (c_p * np.cos(roll))  # 小角近似可直接用 1
+        gz_b =  g * (c_p * np.cos(roll))  # 小角可近似为 g
         grav = np.stack([gx_b, gy_b, gz_b], axis=-1).astype(np.float32)
         acc_true = acc_true - grav
 
-    return acc_true, gyr_true, a_var, g_var, roll, pitch, speed
+    # === 3) 传感器噪声方差轨迹（保持与旧版相近的"随运动强度变化"的日程） ===
+    # 你可以替换为原函数里的 schedule；这里给一个稳定且与运动强度相关的示例
+    v_eps = np.clip(v / (np.max(v)+1e-6), 0.0, 1.0)
+    w_eps = np.clip(np.abs(yaw_rate) / (np.max(np.abs(yaw_rate))+1e-6), 0.0, 1.0)
+    a_var = (0.03 + 0.02 * v_eps)**2     # 加计 ~ 速度越快噪声略增
+    g_var = (0.002 + 0.002 * w_eps)**2   # 陀螺 ~ 转向越猛噪声略增
+
+    speed = v.astype(np.float32)
+    return acc_true, gyr_true, a_var.astype(np.float32), g_var.astype(np.float32), roll, pitch, speed
 
 def simulate_imu(T, dt, seed, **phys):
     rng = np.random.default_rng(seed)
@@ -363,7 +465,13 @@ def make_splits(out_dir: Path,
                 vis_win:int, vis_str:int, noise_px:float, outlier_ratio:float, min_match:int,
                 # 新增时变参数
                 noise_tau_s:float, noise_ln_std:float, out_tau_s:float,
-                burst_prob:float, burst_gain:tuple, motion_k1:float, motion_k2:float, lp_pool_p:float):
+                burst_prob:float, burst_gain:tuple, motion_k1:float, motion_k2:float, lp_pool_p:float,
+                # 引擎参数（有默认值）
+                eng_v_max:float=20.0, eng_a_lat_max:float=4.0, eng_a_lon_max:float=2.5,
+                eng_delta_max:float=0.5, eng_ddelta_max:float=0.6, eng_tau_delta:float=0.25,
+                eng_sigma_max:float=0.30, eng_jerk_lat_max:float=6.0, eng_grade_std:float=0.01,
+                # 轨迹可视化参数（有默认值）
+                plot_trajectories:bool=True, plot_individual:bool=False, plot_dir:str="trajectory_plots"):
 
     def preprocess(x_long, mode, ma_len):
         if mode == "raw": return x_long
@@ -413,18 +521,35 @@ def make_splits(out_dir: Path,
         Xg_list,Eg_list,Mg_list,YGg_list = [],[],[],[]
         Xv_list,Ev_list,Mv_list = [],[],[]
         seg_list = []  # (per-route) camera timeline labels
+        trajectories = []  # 收集轨迹数据用于可视化
 
         print(f"[{split_name}] Processing {num_routes} routes...")
-        for r in range(num_routes):
-            print(f"  Route {r+1}/{num_routes}...", end=" ", flush=True)
+        pbar = tqdm(range(num_routes), desc=f"  {split_name.capitalize()}", unit="route")
+        for r in pbar:
             seed_r = seed_base + r
             # 生成 IMU 长序列
             X_imu, E2_imu, Yacc, Ygyr, roll, pitch, speed, yaw, xy = simulate_imu(T_long, dt, seed_r,
                                                                           use_slip=use_slip,
                                                                           use_gravity=use_gravity,
                                                                           use_roll_pitch=use_roll_pitch,
-                                                                          bank_gain=bank_gain, pitch_gain=pitch_gain)
+                                                                          bank_gain=bank_gain, pitch_gain=pitch_gain,
+                                                                          eng_v_max=eng_v_max, eng_a_lat_max=eng_a_lat_max,
+                                                                          eng_a_lon_max=eng_a_lon_max, eng_delta_max=eng_delta_max,
+                                                                          eng_ddelta_max=eng_ddelta_max, eng_tau_delta=eng_tau_delta,
+                                                                          eng_sigma_max=eng_sigma_max, eng_jerk_lat_max=eng_jerk_lat_max,
+                                                                          eng_grade_std=eng_grade_std)
             # 现在使用真值 yaw/xy（避免陀螺积分漂移导致相机走出点云走廊）
+            
+            # 收集轨迹数据用于可视化
+            if plot_trajectories:
+                t = np.arange(T_long) * dt
+                traj = {
+                    "t": t,
+                    "gt_enu": np.column_stack([xy[:, 0], xy[:, 1], np.zeros(T_long)]),  # 使用真值xy，z=0
+                    "yaw": yaw,
+                    "speed": speed
+                }
+                trajectories.append(traj)
 
             # 根据该route的行驶距离动态生成点云
             dist_est = float(np.sum(speed) * dt)                 # ≈ 平均速度 × 时长
@@ -456,8 +581,7 @@ def make_splits(out_dir: Path,
                 inlier_norm = X_vis[valid, 0]  # 内点比例
                 flow_mean = X_vis[valid, 1]    # 光流均值
                 baseline = X_vis[valid, 3]     # 基线范数
-                print(f"[{split_name}/route{r}] med_inlier_norm={np.median(inlier_norm):.3f}, "
-                      f"med_flow={np.median(flow_mean):.2f}px, med_baseline={np.median(baseline):.3f}")
+# 调试信息移至tqdm进度条
             # 段落标注（启发式）：1=纯旋(转动大/基线小)，2=弱视差(流量小&基线小)，3=内点下降(内点比小)
             seg_id = np.zeros((T_cam,), dtype=np.int32)
             baseline = X_vis[:,3]
@@ -500,9 +624,14 @@ def make_splits(out_dir: Path,
             Xv = sliding_window(X_vis,         vis_win, vis_str)
             Ev = sliding_window(E2_vis[:,None],vis_win, vis_str)
             Mv = sliding_window(M_vis[:,None], vis_win, vis_str)[:, :, 0]
-            print(f"[{split_name}/route{r}] VIS windows={Xv.shape[0]} from T_cam={T_cam}, window_coverage={Mv.mean():.3f}")
             Xv_list.append(Xv); Ev_list.append(Ev); Mv_list.append(Mv)
-            print("✓")  # 标记该route完成
+            
+            # 更新进度条状态信息
+            pbar.set_postfix({
+                'VIS_win': Xv.shape[0],
+                'coverage': f"{Mv.mean():.2f}",
+                'T_cam': T_cam
+            })
 
         # 拼接
         Xa  = np.concatenate(Xa_list,0).astype(np.float32)
@@ -524,6 +653,22 @@ def make_splits(out_dir: Path,
         np.save(out_dir / f"{split_name}_seg_id.npy", seg_all.astype(np.int32))
 
         print(f"[{split_name}] routes={num_routes} | ACC windows={Xa.shape[0]} | GYR windows={Xg.shape[0]} | VIS windows={Xv.shape[0]}")
+        
+        # 生成轨迹可视化
+        if plot_trajectories and trajectories:
+            plot_dir_path = Path(plot_dir)
+            plot_dir_path.mkdir(parents=True, exist_ok=True)
+            plot_all_trajectories(trajectories, split_name, plot_dir_path)
+            
+            if plot_individual:
+                split_dir = plot_dir_path / split_name
+                split_dir.mkdir(parents=True, exist_ok=True)
+                for i, traj in tqdm(enumerate(trajectories), desc=f"    Plotting {split_name} routes", total=len(trajectories), unit="plot"):
+                    title = f"{split_name.title()} Route {i} (seed={seed_base + i})"
+                    save_path = split_dir / f"route_{i:02d}.png"
+                    plot_trajectory(traj, title=title, save_path=save_path)
+                print(f"Saved {len(trajectories)} individual trajectory plots in {split_dir}")
+        
         return (Xa,Ea,Ma,YAa),(Xg,Eg,Mg,YGg),(Xv,Ev,Mv)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -629,6 +774,25 @@ def main():
     ap.add_argument("--use_roll_pitch", action="store_true")
     ap.add_argument("--bank_gain", type=float, default=1.0)
     ap.add_argument("--pitch_gain", type=float, default=1.0)
+    
+    # 引擎参数（可选）
+    ap.add_argument("--eng_v_max", type=float, default=20.0)
+    ap.add_argument("--eng_a_lat_max", type=float, default=4.0)
+    ap.add_argument("--eng_a_lon_max", type=float, default=2.5)
+    ap.add_argument("--eng_delta_max", type=float, default=0.5)
+    ap.add_argument("--eng_ddelta_max", type=float, default=0.6)
+    ap.add_argument("--eng_tau_delta", type=float, default=0.25)
+    ap.add_argument("--eng_sigma_max", type=float, default=0.30)
+    ap.add_argument("--eng_jerk_lat_max", type=float, default=6.0)
+    ap.add_argument("--eng_grade_std", type=float, default=0.01)
+    
+    # 轨迹可视化
+    ap.add_argument("--plot_trajectories", action="store_true", default=vis.get("plot_trajectories", True),
+                    help="生成轨迹可视化图")
+    ap.add_argument("--plot_individual", action="store_true", default=vis.get("plot_individual", False),
+                    help="为每条轨迹生成单独的图")
+    ap.add_argument("--plot_dir", default=vis.get("plot_dir", "trajectory_plots"),
+                    help="轨迹图保存目录")
 
     # IMU 两路
     ap.add_argument("--acc_window", type=int, default=512)
@@ -688,7 +852,11 @@ def main():
         args.cam_rate_hz, args.img_w, args.img_h, args.fx, args.fy, args.cx, args.cy,
         args.vis_window, args.vis_stride, args.noise_px, args.outlier_ratio, args.min_match,
         args.noise_tau_s, args.noise_ln_std, args.out_tau_s,
-        args.burst_prob, args.burst_gain, args.motion_k1, args.motion_k2, args.lp_pool_p
+        args.burst_prob, args.burst_gain, args.motion_k1, args.motion_k2, args.lp_pool_p,
+        args.eng_v_max, args.eng_a_lat_max, args.eng_a_lon_max,
+        args.eng_delta_max, args.eng_ddelta_max, args.eng_tau_delta,
+        args.eng_sigma_max, args.eng_jerk_lat_max, args.eng_grade_std,
+        args.plot_trajectories, args.plot_individual, args.plot_dir
     )
     print("Done.")
 
