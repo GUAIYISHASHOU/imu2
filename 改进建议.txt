@@ -1,281 +1,306 @@
-1) metrics.py —— 新增工具 + 改造 GNSS 逐轴指标
-直接把下面这段整块粘贴到文件末尾（不影响现有接口）；并把原有的 route_metrics_gns_axes 用这里的同名实现覆盖即可。
-
-python
-Copy
-Edit
-# ======= append to metrics.py =======
-from typing import Dict, Tuple, List
-
-def _spearman_no_scipy(x: np.ndarray, y: np.ndarray) -> float:
-    if x.size < 3 or y.size < 3:
-        return 0.0
-    rx = np.argsort(np.argsort(x))
-    ry = np.argsort(np.argsort(y))
-    c = np.corrcoef(rx, ry)
-    return float(c[0, 1])
-
-def _student_t_z2_thresholds(nu: float, coverages=(0.68, 0.95)) -> Dict[str, float]:
+需要修改的文件：gen_bicycle_dual_vis.py
+①【添加】ActiveMap 实现（放在 project_points 上方的工具区即可）
+# ==== Active sliding map (dynamic landmarks that follow the camera) ====
+class ActiveMap:
     """
-    双侧覆盖率阈值：给定 Student-t(ν)，返回 z^2=e^2/var 的阈值（不取 sqrt）。
-    例如 p=0.95 -> |t|<=t_{(1+p)/2}，z2_thresh = t^2
+    维护一个“活动地标池”：按相机位置/航向，保证走廊里至少有 target_local 个点；
+    超出上限就按“最久未见优先 + 远离当前走廊”淘汰。所有地标都有“全局 ID”（持久）。
     """
-    import torch
-    tdist = torch.distributions.StudentT(df=nu)
-    out = {}
-    for p in coverages:
-        q = float(tdist.icdf(torch.tensor([(1.0 + p) / 2.0]))[0])  # 正分位
-        out[f"{int(round(p*100))}"] = q * q
-    return out
+    def __init__(self, rng, cell_m=10.0, max_points=60000, keep_horizon_frames=60, z_range=(-1.0, 3.0)):
+        self.rng = rng
+        self.cell_m = float(cell_m)
+        self.max_points = int(max_points)
+        self.keep_h = int(max(1, keep_horizon_frames))
+        self.z_range = z_range
 
-def _reliability_by_var(e2: np.ndarray, v: np.ndarray, m: np.ndarray, nbuckets: int = 10) -> dict:
-    mask = (m.reshape(-1) > 0.5)
-    if mask.sum() == 0:
-        return {"bucket_edges": [], "bucket_ez2": [], "bucket_var": [], "bucket_err2": [],
-                "slope": 0.0, "spearman": 0.0}
-    e2 = e2.reshape(-1)[mask]
-    v  = v.reshape(-1)[mask]
-    v  = np.clip(v, 1e-12, None)
+        self.next_id = 0                            # 递增 ID 分配器
+        self.pos = {}                               # id -> np.array([x,y,z], float32)
+        self.last_seen = {}                         # id -> last frame index (int)
+        self.grid = {}                              # (i,j) -> set(ids)
 
-    # 分位桶
-    edges = np.quantile(v, np.linspace(0.0, 1.0, nbuckets + 1))
-    idx = np.digitize(v, edges[1:-1], right=True)
-    bucket_ez2, bucket_var, bucket_err2 = [], [], []
-    for b in range(nbuckets):
-        sel = (idx == b)
-        if sel.sum() == 0:
-            bucket_ez2.append(float("nan"))
-            bucket_var.append(float("nan"))
-            bucket_err2.append(float("nan"))
+    # ---- 内部小工具 ----
+    def _cell_of(self, xy):
+        return (int(np.floor(xy[0] / self.cell_m)), int(np.floor(xy[1] / self.cell_m)))
+
+    def _grid_add(self, _id, p):
+        key = self._cell_of(p[:2])
+        s = self.grid.get(key)
+        if s is None:
+            s = set()
+            self.grid[key] = s
+        s.add(_id)
+
+    def _grid_del(self, _id, p):
+        key = self._cell_of(p[:2])
+        s = self.grid.get(key)
+        if s is not None and _id in s:
+            s.remove(_id)
+            if not s:
+                self.grid.pop(key, None)
+
+    def _insert_points(self, P):
+        """在当前帧插入一批新点（世界系），返回分配的全局ID数组"""
+        ids = np.empty(P.shape[0], np.int32)
+        for k, p in enumerate(P):
+            _id = self.next_id
+            self.next_id += 1
+            self.pos[_id] = p.astype(np.float32)
+            self.last_seen[_id] = -10**9
+            self._grid_add(_id, p)
+            ids[k] = _id
+        return ids
+
+    def _remove_ids(self, ids):
+        for _id in ids:
+            p = self.pos.pop(_id, None)
+            if p is not None:
+                self._grid_del(_id, p)
+            self.last_seen.pop(_id, None)
+
+    # ---- 采样：在相机前向走廊内均匀撒点（局部坐标→世界） ----
+    def _sample_in_corridor(self, n, pos_xy, yaw, fwd_m, lat_m):
+        if n <= 0: return np.zeros((0,3), np.float32)
+        xb = self.rng.uniform(0.0,  fwd_m, size=n).astype(np.float32)
+        yb = self.rng.uniform(-lat_m, lat_m, size=n).astype(np.float32)
+        c, s = np.cos(yaw), np.sin(yaw)
+        X = pos_xy[0] + c*xb - s*yb
+        Y = pos_xy[1] + s*xb + c*yb
+        Z = self.rng.uniform(self.z_range[0], self.z_range[1], size=n).astype(np.float32)
+        return np.stack([X, Y, Z], axis=-1).astype(np.float32)
+
+    # ---- 查询：取落在“前向走廊”的 id 列表 ----
+    def _query_corridor_ids(self, pos_xy, yaw, fwd_m, lat_m):
+        # 先用 AABB 选 cell 候选集合
+        # 取一个包含旋转矩形的轴对齐盒：半宽 ~ lat_m + fwd_m
+        r = fwd_m + lat_m
+        x0, y0 = float(pos_xy[0]), float(pos_xy[1])
+        i0 = int(np.floor((x0 - r) / self.cell_m)); i1 = int(np.floor((x0 + r) / self.cell_m))
+        j0 = int(np.floor((y0 - r) / self.cell_m)); j1 = int(np.floor((y0 + r) / self.cell_m))
+        cand = []
+        for i in range(i0, i1+1):
+            for j in range(j0, j1+1):
+                s = self.grid.get((i,j))
+                if s: cand.append(s)
+        if not cand:
+            return np.zeros((0,), np.int32)
+        ids = np.fromiter(set().union(*cand), dtype=np.int32)
+
+        # 精过滤：坐标旋到车体系，保留 0<xb<fwd_m 且 |yb|<lat_m
+        if ids.size == 0: return ids
+        P = np.stack([self.pos[int(_id)] for _id in ids], axis=0)[:, :2]
+        P = P - np.array([x0, y0], np.float32)
+        c, s = np.cos(-yaw), np.sin(-yaw)
+        xb = c*P[:,0] - s*P[:,1]
+        yb = s*P[:,0] + c*P[:,1]
+        m = (xb > 0.0) & (xb < fwd_m) & (np.abs(yb) < lat_m)
+        return ids[m]
+
+    # ---- 核心接口：确保局部有足够地标，并返回该帧的局部 id 与位置 ----
+    def ensure_and_query(self, frame_idx, pos_xy, yaw, fwd_m, lat_m, target_local):
+        # 1) 查询已有局部地标
+        ids_local = self._query_corridor_ids(pos_xy, yaw, fwd_m, lat_m)
+        n_need = max(0, int(target_local) - ids_local.size)
+
+        # 2) 若不足，现采新点（就在当前走廊里），并立即加入
+        if n_need > 0:
+            Pnew = self._sample_in_corridor(n_need, pos_xy, yaw, fwd_m, lat_m)
+            new_ids = self._insert_points(Pnew)
+            # 新采的都在走廊里，可以直接并入本帧局部集合
+            ids_local = np.concatenate([ids_local, new_ids], axis=0)
+
+        # 3) 更新“被看到”的时间戳
+        for _id in ids_local:
+            self.last_seen[int(_id)] = frame_idx
+
+        # 4) 超限时做淘汰：先丢掉“不是本帧局部”的最久未见；仍超限就按照 last_seen 从旧到新丢
+        n_excess = len(self.pos) - self.max_points
+        if n_excess > 0:
+            local_set = set(int(x) for x in ids_local.tolist())
+            # 候选：所有点里剔除本帧局部
+            cand = [(_id, t) for _id, t in self.last_seen.items() if _id not in local_set]
+            cand.sort(key=lambda kv: kv[1])  # 最旧在前
+            drop = [kv[0] for kv in cand[:n_excess]]
+            if drop:
+                self._remove_ids(drop)
+
+        # 5) 也可做基于 keep_h 的老化淘汰（离开很久的点）
+        old = [ _id for _id, t in self.last_seen.items() if (frame_idx - t) > self.keep_h ]
+        if old:
+            self._remove_ids(old)
+
+        # 6) 返回 ids_local 与其位置数组
+        P_local = np.stack([self.pos[int(_id)] for _id in ids_local], axis=0) if ids_local.size>0 \
+                  else np.zeros((0,3), np.float32)
+        return ids_local.astype(np.int32), P_local.astype(np.float32)
+
+
+说明：
+
+keep_horizon_frames 让地标在离开视野后还能存活一段时间，保证帧间 ID 重叠。
+
+采样是直接在“前向走廊”里现采，确保每帧立刻可见；ID 会持久存在，直到被淘汰。
+
+网格索引用 (i,j)->set(ids)，插入/删除 O(1)，查询先 AABB 再精过滤，速度很稳。
+
+②【微调】project_points 支持子集全局 ID（如果你之前已改过，这段可保持）
+def project_points(Pw, Rcw, tcw, K, img_wh, noise_px=0.5, rng=None, base_ids=None):
+    if rng is None:
+        rng = np.random.default_rng(0)
+    Pc_all = (Rcw @ Pw.T).T + tcw
+    Z = Pc_all[:, 2]
+    vis_mask = Z > 0.3
+    uv_all = (K @ (Pc_all.T / np.clip(Z, 1e-6, None))).T[:, :2]
+    W, H = img_wh
+    in_img = (uv_all[:, 0] >= 0) & (uv_all[:, 0] < W) & (uv_all[:, 1] >= 0) & (uv_all[:, 1] < H)
+    mask = vis_mask & in_img
+    if not np.any(mask):
+        return np.zeros((0, 2), np.float32), np.zeros((0,), np.int32), np.zeros((0, 3), np.float32)
+    ids_local = np.where(mask)[0]
+    ids_global = (base_ids[ids_local] if base_ids is not None else ids_local.astype(np.int32))
+    uv_noisy = uv_all[mask] + rng.normal(scale=noise_px, size=(int(mask.sum()), 2)).astype(np.float32)
+    return uv_noisy.astype(np.float32), ids_global, Pc_all[mask].astype(np.float32)
+
+③【修改】simulate_vision_from_trajectory(...) 接口与帧循环（启用滑动地图）
+
+把函数签名末尾新增这些参数（默认开启滑动地图），并在内部初始化 ActiveMap：
+
+def simulate_vision_from_trajectory(
+    T_cam, t_cam_idx, yaw, roll, pitch, xy, speed, dt_cam,
+    K, img_wh, Pw_dummy, noise_px=0.5, outlier_ratio=0.1, min_match=20, seed=0,
+    # 时变噪声...
+    noise_tau_s=0.4, noise_ln_std=0.30, out_tau_s=0.6,
+    burst_prob=0.03, burst_gain=(0.2, 0.6), motion_k1=0.8, motion_k2=0.4, lp_pool_p=3.0,
+    # === 新增：真·滑动地图参数 ===
+    use_sliding_map=True,
+    local_cell_m=10.0,          # 网格大小（m）
+    local_fwd_m=120.0,          # 前向走廊长度
+    local_lat_m=40.0,           # 横向半宽
+    target_local=4000,          # 每帧希望在走廊内至少有多少个地标
+    max_points=60000,           # 活动地标上限（全局）
+    keep_horizon_s=3.0,         # 老化时间（秒），相机频率下折算成帧数
+    pb_desc=None
+):
+    rng = np.random.default_rng(seed)
+    # ...（保留你原有的 噪声OU / 外点率OU / 运动调节 / Rcw/ Kinv 等代码）
+
+    # 相机时刻的位姿与时间参数
+    Rcw_all, tcw_all = camera_poses_from_imu(yaw[t_cam_idx], roll[t_cam_idx], pitch[t_cam_idx],
+                                             xy[t_cam_idx], z_height=1.2,
+                                             R_cb=np.array([[0,-1,0],[0,0,-1],[1,0,0]], np.float32), t_cb=np.zeros(3,np.float32))
+    Kinv = np.linalg.inv(K).astype(np.float32)
+
+    # === 初始化滑动地图 ===
+    keep_h_frames = int(round(max(1e-3, keep_horizon_s) / dt_cam))
+    amap = ActiveMap(rng, cell_m=local_cell_m, max_points=max_points,
+                     keep_horizon_frames=keep_h_frames, z_range=(-1.0, 3.0))
+
+    UV, idlists, Pc_list = [], [], []
+    frame_iter = tqdm(range(T_cam), desc=pb_desc, leave=False) if pb_desc else range(T_cam)
+    xy_cam = xy[t_cam_idx]; yaw_cam_full = yaw[t_cam_idx]
+
+    for k in frame_iter:
+        if use_sliding_map:
+            ids_subset, P_subset = amap.ensure_and_query(
+                frame_idx=k,
+                pos_xy=xy_cam[k], yaw=yaw_cam_full[k],
+                fwd_m=local_fwd_m, lat_m=local_lat_m,
+                target_local=target_local
+            )
+            if ids_subset.size == 0:
+                UV.append(np.zeros((0,2), np.float32))
+                idlists.append(np.zeros((0,), np.int32))
+                Pc_list.append(np.zeros((0,3), np.float32))
+                continue
+            uv, ids_global, Pc = project_points(
+                P_subset, Rcw_all[k], tcw_all[k], K, img_wh,
+                noise_px=noise_px_t[k], rng=rng, base_ids=ids_subset
+            )
         else:
-            bucket_ez2.append(float(np.mean(e2[sel] / v[sel])))
-            bucket_var.append(float(np.mean(v[sel])))
-            bucket_err2.append(float(np.mean(e2[sel])))
+            # 兼容旧模式（若你保留了静态 Pw + 查询）
+            uv, ids_global, Pc = project_points(
+                Pw_dummy, Rcw_all[k], tcw_all[k], K, img_wh,
+                noise_px=noise_px_t[k], rng=rng
+            )
+        UV.append(uv); idlists.append(ids_global); Pc_list.append(Pc)
 
-    # 相关性与斜率：log(err²) ~ a*log(var)+b
-    X = np.log(v)
-    Y = np.log(np.clip(e2, 1e-18, None))
-    A = np.vstack([X, np.ones_like(X)]).T
-    a, b = np.linalg.lstsq(A, Y, rcond=None)[0]  # slope, intercept
-    spearman = _spearman_no_scipy(X, Y)
+    # ====== 下面保持你原有的匹配 / Sampson / 特征 X_vis / MASK 的代码 ======
+    # （无需改动，只是 idlists 现在是“全局 ID”，帧间 intersect1d 照常工作）
+    ...
 
-    return {
-        "bucket_edges": [float(e) for e in edges],
-        "bucket_ez2": bucket_ez2,
-        "bucket_var": bucket_var,
-        "bucket_err2": bucket_err2,
-        "slope": float(a),
-        "spearman": float(spearman),
-    }
 
-@torch.no_grad()
-def route_metrics_gns_axes(e2_axes: torch.Tensor, logv_axes: torch.Tensor, mask_axes: torch.Tensor,
-                           logv_min: float, logv_max: float, nu: float = 0.0) -> dict:
-    """
-    GNSS 各向异性评测（逐轴）：统一 t 口径 + 高斯口径对照，并输出可靠性曲线。
-    - e2_axes: (B,T,3) 逐轴误差平方（ENU）
-    - logv_axes: (B,T,3) 逐轴 log(var)
-    - mask_axes: (B,T,3)
-    """
-    lv = torch.clamp(logv_axes, min=logv_min, max=logv_max)
-    v  = torch.clamp(torch.exp(lv), min=1e-12)
-    m  = mask_axes.float()
-    z2 = (e2_axes / v)  # 1D z²
-    den = m.sum(dim=(0,1)).clamp_min(1.0)  # (3,)
+注意：
 
-    # —— t 口径（若 nu>2）——
-    out = {}
-    if nu and nu > 2.0:
-        target = float(nu / (nu - 2.0))  # E[t^2]
-        thr_t = _student_t_z2_thresholds(nu, coverages=(0.68, 0.95))
-        z2_mean_raw = (z2 * m).sum(dim=(0,1)) / den                       # (3,)
-        z2_mean_norm = z2_mean_raw / target                                # (3,)
-        cov68_t = ((z2 <= thr_t["68"]).float() * m).sum(dim=(0,1)) / den
-        cov95_t = ((z2 <= thr_t["95"]).float() * m).sum(dim=(0,1)) / den
-        out.update({
-            "t_nu": nu,
-            "t_target": target,
-            "z2_mean_raw": z2_mean_raw.detach().cpu().tolist(),
-            "z2_mean_norm": z2_mean_norm.detach().cpu().tolist(),
-            "cov68_t": cov68_t.detach().cpu().tolist(),
-            "cov95_t": cov95_t.detach().cpu().tolist(),
-            "t_z2_thr68": thr_t["68"],
-            "t_z2_thr95": thr_t["95"],
-        })
-    else:
-        target = 1.0  # 回落到高斯口径
+我把 Pw 参数名改成 Pw_dummy（在滑动地图模式里它不会被用到）。
 
-    # —— 高斯口径对照（χ² df=1）——
-    cov68_g = ((z2 <= 1.0).float() * m).sum(dim=(0,1)) / den
-    cov95_g = ((z2 <= 3.841).float() * m).sum(dim=(0,1)) / den
-    z2_mean = (z2 * m).sum(dim=(0,1)) / den
-    out.update({
-        "z2_mean_gauss": z2_mean.detach().cpu().tolist(),
-        "cov68_g": cov68_g.detach().cpu().tolist(),
-        "cov95_g": cov95_g.detach().cpu().tolist(),
-    })
+其它逻辑（交集匹配、注入外点、E 的计算、X_vis 统计）完全不需要改。
 
-    # —— 可靠性曲线（分桶） —— 
-    e2_np = e2_axes.detach().cpu().numpy()
-    v_np  = v.detach().cpu().numpy()
-    m_np  = m.detach().cpu().numpy()
-    rel = [_reliability_by_var(e2_np[...,i], v_np[...,i], m_np[...,i], nbuckets=10) for i in range(e2_np.shape[-1])]
-    out["reliability"] = rel  # list of dicts per axis
+④【替换】one_split(...) 里“生成 Pw + 网格索引 + 调 simulate_vision_from_trajectory”的那段
 
-    return out
-# ======= end append =======
-兼容性：我们保留了函数名 route_metrics_gns_axes，并在参数末尾加了 nu: float=0.0 的默认值，所以训练侧如果仍旧按 5 个参数调用不会报错。
+删除你原来的：
 
-2) eval.py —— 新增参数 + 支持估计/加载 post_scale + 输出双口径指标和可靠性
-把下列三处改动贴进去（均为独立可搜索锚点，便于你直接替换）。
+# （原）根据距离估 x_max / density / num_pts / Pw = sample_landmarks(...)
+# （原）grid_index = build_xy_grid_index(Pw, cell_m=...)
+# （原）simulate_vision_from_trajectory(..., Pw, ..., use_local_map=..., local_index=grid_index, ...)
 
-2.1 参数解析（在 parse_args() 里补充）
-python
-Copy
-Edit
-# 增加在 ap.add_argument(...) 列表末尾
-ap.add_argument("--nu", type=float, default=0.0, help="Student-t 自由度（评测口径）；0 表示用高斯口径")
-ap.add_argument("--post_scale_json", type=str, default=None, help="按轴温度缩放系数 JSON（评测时应用）")
-ap.add_argument("--est_post_scale_from", type=str, default=None, help="从此 npz（一般是val集）估计按轴温度缩放")
-ap.add_argument("--save_post_scale_to", type=str, default=None, help="把估计的缩放系数保存到 JSON")
-备注：如果你希望默认跟随 ckpt 中保存的 student_nu，也可以在加载模型参数后将 args.nu 设为 md_args.get("student_nu", 0.0)。
 
-2.2 工具函数（在 main() 前加）
-python
-Copy
-Edit
-def _apply_post_scale(logv: torch.Tensor, c_axis: torch.Tensor | None) -> torch.Tensor:
-    if c_axis is None:
-        return logv
-    return logv + c_axis.log().view(1,1,-1).to(logv.device, logv.dtype)
+换成滑动地图调用（把新参数从 vis 段读取，给默认值）：
 
-@torch.no_grad()
-def _estimate_post_scale_gns_axes(model, dl, device, logv_min, logv_max, nu: float) -> torch.Tensor:
-    """在验证集估 c_axis = E[z²]/target（target=t:nu/(nu-2), 否则=1）"""
-    num = torch.zeros(3, device=device)
-    den = torch.zeros(3, device=device)
-    target = nu/(nu-2.0) if (nu and nu>2.0) else 1.0
-    for batch in dl:
-        b = to_device(batch, device)
-        logv = model(b["X"])
-        lv = torch.clamp(logv, min=logv_min, max=logv_max)
-        v  = torch.exp(lv).clamp_min(1e-12)
-        e2 = b["E2_AXES"]; m = b["MASK_AXES"].float()
-        z2 = e2 / v
-        num += (z2 * m).sum(dim=(0,1))
-        den += m.sum(dim=(0,1)).clamp_min(1.0)
-    ez2 = num / den
-    c = (ez2 / target).clamp_min(1e-6)  # (3,)
-    return c.detach()
-2.3 主流程中应用（替换 GNSS 分支的评测汇总）
-把你当前 eval.py 里 “GNSS逐维分析（汇总所有批次）” 那个大段替换为下面这段（会同时输出 per_axis.json 和 reliability.json 到同目录）：
+# --- 读取/给定滑动地图参数（可从 cfg.vis 里读）
+cell_m        = float(vis.get("local_cell_m", 10.0))
+local_fwd_m   = float(vis.get("local_fwd_m", 120.0))
+local_lat_m   = float(vis.get("local_lat_m", 40.0))
+target_local  = int(  vis.get("sliding_target_local", 4000))
+max_points    = int(  vis.get("sliding_max_points", 60000))
+keep_h_s      = float(vis.get("sliding_keep_s", 3.0))
 
-python
-Copy
-Edit
-# ==== GNSS逐维分析（支持t口径+post_scale）====
-if args.route == "gns":
-    import numpy as np, json
-    # —— 可选：从 val 集估计 post_scale 并存盘 ——
-    c_axis = None
-    if args.est_post_scale_from:
-        ds_val, dl_val = build_loader(args.est_post_scale_from, route="gns", x_mode=args.x_mode,
-                                      batch_size=64, shuffle=False, num_workers=0)
-        c_axis = _estimate_post_scale_gns_axes(model, dl_val, args.device,
-                                               md_args.get("logv_min",-12.0),
-                                               md_args.get("logv_max",6.0),
-                                               args.nu)
-        if args.save_post_scale_to:
-            Path(args.save_post_scale_to).write_text(json.dumps({
-                "axis": ["E","N","U"], "c_axis": c_axis.cpu().tolist(),
-                "nu": args.nu, "target": (args.nu/(args.nu-2.0) if (args.nu and args.nu>2.0) else 1.0)
-            }, ensure_ascii=False, indent=2))
-            print("[post_scale] saved to:", args.save_post_scale_to)
-    # —— 可选：从 json 载入 post_scale ——
-    if (c_axis is None) and args.post_scale_json:
-        js = json.loads(Path(args.post_scale_json).read_text())
-        c_axis = torch.tensor(js["c_axis"], dtype=torch.float32, device=args.device)
+K = np.array([[fx,0,cx],[0,fy,cy],[0,0,1]], np.float32)
+dt_cam = cam_step * (1.0 / rate_hz)
 
-    # —— 汇总所有批次：注意应用 post_scale 到 logv ——
-    all_e2, all_v, all_m = [], [], []
-    with torch.no_grad():
-        for batch in dl:
-            b = to_device(batch, args.device)
-            logv = model(b["X"])                       # (B,T,3)
-            if c_axis is not None:
-                logv = _apply_post_scale(logv, c_axis) # 应用按轴温度缩放
-            lv = torch.clamp(logv, min=md_args.get("logv_min",-12.0), max=md_args.get("logv_max",6.0))
-            var = torch.exp(lv).clamp_min(1e-12)
-            all_e2.append(b["E2_AXES"].cpu()); all_v.append(var.cpu()); all_m.append(b["MASK_AXES"].cpu())
+# 传入一个空的占位 Pw（不会被使用）
+Pw_dummy = np.zeros((0,3), np.float32)
 
-    e2_axes = torch.cat(all_e2, 0); var_axes = torch.cat(all_v, 0); mask_axes = torch.cat(all_m, 0)
+E2_vis, X_vis, M_vis = simulate_vision_from_trajectory(
+    T_cam, t_cam_idx, yaw, roll, pitch, xy, speed, dt_cam, K, (img_w,img_h), Pw_dummy,
+    noise_px=noise_px, outlier_ratio=outlier_ratio, min_match=min_match, seed=seed_r+999,
+    noise_tau_s=noise_tau_s, noise_ln_std=noise_ln_std, out_tau_s=out_tau_s,
+    burst_prob=burst_prob, burst_gain=burst_gain, motion_k1=motion_k1, motion_k2=motion_k2, lp_pool_p=lp_pool_p,
+    use_sliding_map=True,
+    local_cell_m=cell_m, local_fwd_m=local_fwd_m, local_lat_m=local_lat_m,
+    target_local=target_local, max_points=max_points, keep_horizon_s=keep_h_s,
+    pb_desc=f"{split_name}/route{r} frames ({T_cam})"
+)
 
-    # 指标（t 口径 + 高斯口径对照 + 可靠性）
-    st_axes = route_metrics_gns_axes(e2_axes, var_axes.log(), mask_axes,
-                                     md_args.get("logv_min",-12.0), md_args.get("logv_max",6.0),
-                                     nu=args.nu)
-    # 保存
-    out_dir = Path(args.model).parent
-    (out_dir/"per_axis.json").write_text(json.dumps(st_axes, ensure_ascii=False, indent=2))
-    print("[gns] per-axis metrics saved to", out_dir/"per_axis.json")
-现在 eval.py 会把两种口径都写进 per_axis.json。你的现有版本是只写了 Ez2/cov68/cov95 且覆盖率阈值固定为 1.0/3.841（高斯口径）。
 
-3) analyze.py —— 直方图/覆盖率图：改用 t 口径并输出一份“高斯对照”
-在 parse_args() 里补充两个参数：
+其他部分（IMU 窗口化、VIS 窗口化、保存 npz、分段统计）不用改。
 
-python
-Copy
-Edit
-ap.add_argument("--nu", type=float, default=0.0, help="Student-t 自由度（作图口径）；0 表示只画高斯口径")
-ap.add_argument("--post_scale_json", type=str, default=None, help="评图时应用按轴温度缩放 JSON")
-在 GNSS 作图处（原先你计算 z2=e2/var、并画直方图/散点的地方），用如下函数替换阈值与图例标注逻辑：
+⑤【可选但建议】把 X_vis[k,0] 设为实际内点数而非“匹配总数”
 
-python
-Copy
-Edit
-def _t_thr(nu, coverages=(0.68,0.95)):
-    if not (nu and nu>2.0): 
-        return {}
-    import torch
-    t = torch.distributions.StudentT(df=nu)
-    th = {}
-    for p in coverages:
-        q = float(t.icdf(torch.tensor([(1+p)/2.0]))[0])
-        th[p] = q*q  # z2 阈值
-    return th
+在你计算 X_vis[k] 那里，把
 
-# ... 得到 z2_E/N/U 三个向量后：
-thr_t = _t_thr(args.nu)
-thr_g = {0.68:1.0, 0.95:3.841}
+num_inl = float(M)        # ← 这是原“匹配数”
+X_vis[k,0] = num_inl / 500.0
 
-# 直方图：在同一张图里画两种口径的竖线
-for axis_name, z2_vec in zip(["E","N","U"], [z2_E, z2_N, z2_U]):
-    plt.figure(figsize=(6,4))
-    plt.hist(z2_vec, bins=100, alpha=0.6)
-    if thr_t:
-        for p,v in thr_t.items(): plt.axvline(v, linestyle="--", label=f"t(ν={args.nu}) {int(p*100)}%")
-    for p,v in thr_g.items(): plt.axvline(v, linestyle=":", label=f"Gaussian {int(p*100)}%")
-    plt.title(f"{axis_name}: z^2 histogram (t & Gaussian thresholds)")
-    plt.xlabel("z^2"); plt.ylabel("count"); plt.legend(); plt.tight_layout()
-    # 保存到 out 目录
-若你也要把覆盖率数字标注在图例里，可直接用 np.mean(z2_vec <= 阈值) 计算两套数字并拼到 label。
 
-4) 运行方式（建议）
-bash
-Copy
-Edit
-# 1) 估计并保存按轴温度缩放（用验证集）
-python eval.py --route gns \
-  --npz data_gns/test_gns.npz \
-  --model runs/gns_tcn_fix/best.pt \
-  --x_mode both \
-  --nu 3.0 \
-  --est_post_scale_from data_gns/val_gns.npz \
-  --save_post_scale_to runs/gns_tcn_fix/post_scale.json
+改为
 
-# 2) 带着 post_scale + t 口径做评测与作图
-python eval.py --route gns --npz data_gns/test_gns.npz --model runs/gns_tcn_fix/best.pt \
-  --x_mode both --nu 3.0 --post_scale_json runs/gns_tcn_fix/post_scale.json
+N_inlier_actual = max(1, M - m_out)  # 注：m_out 是你注入的外点数
+X_vis[k,0] = float(N_inlier_actual) / 500.0
 
-python analyze.py --route gns --npz data_gns/test_gns.npz --model runs/gns_tcn_fix/best.pt \
-  --x_mode both --out plots_gns --nu 3.0 --post_scale_json runs/gns_tcn_fix/post_scale.json
+
+这样 seg_id 的“inlier_drop”更有语义。
+
+⑥【配置】在 config.yaml 的 vis: 段加上（或保持你的默认）
+vis:
+  # 相机与窗口...（照旧）
+  cam_rate_hz: 20.0
+  vis_window: 64
+  vis_stride: 32
+  min_match: 12         # 想更稳先设 8，看健康度回升后再调回 12
+
+  # 滑动地图（真·C）
+  local_cell_m: 10.0
+  local_fwd_m: 120.0
+  local_lat_m: 40.0
+  sliding_target_local: 4000
+  sliding_max_points: 60000
+  sliding_keep_s: 3.0
