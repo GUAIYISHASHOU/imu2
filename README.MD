@@ -1,3 +1,6 @@
+仿真项目
+
+
 # 0) 建议装环境（Python 3.10+；PyTorch >= 2.x；matplotlib）
 pip install torch torchvision torchaudio  # 选你本机 CUDA 版本的安装命令
 pip install matplotlib numpy
